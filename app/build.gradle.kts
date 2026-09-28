@@ -35,6 +35,16 @@ android {
                 storePassword = localProps.getProperty("storePassword")
                 keyAlias = localProps.getProperty("keyAlias")
                 keyPassword = localProps.getProperty("keyPassword")
+                // 签名方案显式指定（不靠 AGP 默认，否则随 minSdk/版本变动而漂移）：
+                //   v1（JAR 签名）关：minSdk 26 = Android 8，v1 只对 API < 24 有意义
+                //   v2 开：API 24+ 的校验路径
+                //   v3 开：**AGP 默认不开**，需显式启用（API 28+；带签名的密钥轮换与更严的校验）
+                //   v4 关（增量安装用，会额外产出 .idsig，本项目不分发它）
+                // CI 会断言产物确实同时具备 v2 + v3（见 .github/workflows/build.yml 的 Verify 步）。
+                enableV1Signing = false
+                enableV2Signing = true
+                enableV3Signing = true
+                enableV4Signing = false
             }
         }
     }

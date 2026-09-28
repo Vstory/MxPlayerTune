@@ -280,6 +280,15 @@ jobs:
             fi
             DIGEST_OF["$VARIANT"]="$ACTUAL"
             echo "  ✅ 签名有效，指纹与固定密钥一致：$ACTUAL"
+
+            # ④ 签名方案须为 **v2 + v3**（显式固定，不靠 AGP 默认 —— v3 默认是关的，
+            #    日后改 minSdk 或升 AGP 若把它带偏，这里会拦下，而不是等装到设备上才发现）。
+            VERBOSE="$("$APKSIGNER" verify --verbose "$APK" 2>&1 || true)"
+            printf '%s' "$VERBOSE" | grep -qE 'Verified using v2 scheme.*: true' \
+              || { echo "::error::$NAME 未启用 v2 签名方案 —— 拒绝发布"; printf '%s\n' "$VERBOSE"; exit 1; }
+            printf '%s' "$VERBOSE" | grep -qE 'Verified using v3 scheme.*: true' \
+              || { echo "::error::$NAME 未启用 v3 签名方案（查 app/build.gradle.kts 的 enableV3Signing）—— 拒绝发布"; printf '%s\n' "$VERBOSE"; exit 1; }
+            echo "  ✅ 签名方案 v2 + v3"
           done
 
           # ④ 两个包必须是**同一把**签名 —— 这才是「Debug 与 Release 可互相覆盖安装」的前提
@@ -288,6 +297,7 @@ jobs:
             || { echo "::error::两个变体签名不一致（${DIGEST_OF[debug]} vs ${DIGEST_OF[release]}）—— 无法互相覆盖安装"; exit 1; }
           echo "✅ 两个变体签名一致：${DIGEST_OF[release]}"
           echo "CERT_SHA256=${DIGEST_OF[release]}" >> "$GITHUB_ENV"
+          echo "SIGN_SCHEMES=v2 + v3（v1 关：minSdk 26，无需 JAR 签名）" >> "$GITHUB_ENV"
 
       # 发布目标：**每次构建一个新 tag**（`<版本>_<时间>_<短号>`），不往固定页滚动更新。
       #   于是每个版本各有独立页面，历史可逐页回看；页面之间靠 tag 区分。
@@ -315,6 +325,7 @@ jobs:
           | \`${PREFIX}_${VER}_${TS}_${SHORT}_Debug.apk\` | 保留 | **排障**（看 hook 是否命中、参数与返回值） |
 
           - 签名证书 SHA-256：\`${CERT_SHA256:-（未读取到）}\`
+          - 签名方案：\`${SIGN_SCHEMES:-（未读取到）}\`
           - 两个包**同包名**，不能同时安装（后装的覆盖先装的）
           - 目标应用：MX Player Pro \`com.mxtech.videoplayer.pro\`（作用域已静态声明，无需手动勾选）
           - 当前功能状态：**阶段 A（探针）** —— 仅验证模块注入与目标定位，尚未实现 WebDAV 浏览
