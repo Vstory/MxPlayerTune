@@ -16,20 +16,29 @@ import java.util.TreeSet;
  * <ul>
  *   <li>{@code com.mxtech.videoplayer.smb.bean.RemoteEntry} 与 {@code SmbServerEntry}
  *       <b>类名未被混淆</b>（真名，跨版本稳定）—— 可作定位锚点</li>
- *   <li>{@code RemoteDataSource} → 混淆名 {@code LYi0}；{@code ServerDataSource} → {@code LHn0}
- *       （R8 已重打包到默认包，dex 的 source_file 属性仍保留真名，仅用于静态分析）</li>
+ *   <li>候选混淆名 {@code LYi0}（RemoteDataSource）/ {@code LHn0}（ServerDataSource）</li>
  * </ul>
  *
  * <p>定位策略（两级，宁可 no-op 也不误 hook）：
  * <ol>
- *   <li><b>快路径</b>：候选混淆名 {@code *_NAMES} + 结构验证（升级后在此追加新名）</li>
- *   <li><b>结构扫描</b>（仅 debug 版）：枚举 classloader 里全部类名 → 逐个套结构判据，
- *       完全不看名字。用于「混淆名已变」时<b>直接把新名字查出来</b>，查到后补进 {@code *_NAMES} 固化</li>
+ *   <li><b>快路径</b>：候选名 {@code *_NAMES} + 结构判据</li>
+ *   <li><b>结构扫描</b>（仅 debug 版）：枚举 classloader 里全部类名 → 逐个套结构判据</li>
+ * </ol>
+ *
+ * <p><b>扫描的三条硬约束</b>（缺一条就会把「没查完」误报成「不存在」）：
+ * <ol>
+ *   <li><b>不设比对条数上限</b> —— 上限会让结论变成「查了一半」。只设<b>时间预算</b>，
+ *       超时明确报【未定】，绝不写「无命中」</li>
+ *   <li><b>不按名字形状过滤</b> —— 只按「框架/三方命名空间前缀」跳过（应用自身 {@code com.mxtech.*}
+ *       绝不跳过），且跳过量照数上报。任何「按名字猜目标长什么样」的过滤都是把假设当事实</li>
+ *   <li><b>必须报 near-miss</b> —— 「持锚点字段但方法形态不符」的类要逐个列出。
+ *       判据失手时它是唯一线索，否则只剩一句无信息的「无命中」</li>
  * </ol>
  *
  * <p>判据（{@link #DETECT_*}）只依赖类型关系，不依赖任何混淆名：
  * <ul>
- *   <li>RemoteDataSource = 持 {@code RemoteEntry} 类型字段 + 有「static + 返回 ArrayList + 唯一参数为自身」的方法</li>
+ *   <li>RemoteDataSource = 持 {@code RemoteEntry}/{@code SmbServerEntry} 类型字段
+ *       + 有「static + 返回 List + 唯一参数为自身」的方法</li>
  *   <li>ServerDataSource = 持 ≥2 个 {@code java.io.File} 字段（服务器列表 JSON + 其 .tmp）</li>
  * </ul>
  *
@@ -45,6 +54,9 @@ final class HookTargets {
     /** 未混淆的服务器 bean（真名）。 */
     static final String CLS_SMB_SERVER_ENTRY = "com.mxtech.videoplayer.smb.bean.SmbServerEntry";
 
+    /** 锚点所在包（triage 用：列出该包下 classloader 可见的类）。 */
+    static final String ANCHOR_PKG = "com.mxtech.videoplayer.smb";
+
     /** RemoteDataSource 候选混淆名（1.93.4 = LYi0）。升级后在此追加新候选。 */
     private static final String[] REMOTE_DS_NAMES = {"LYi0"};
     /** ServerDataSource 候选混淆名（1.93.4 = LHn0）。升级后在此追加新候选。 */
@@ -53,10 +65,26 @@ final class HookTargets {
     private static final String[] REMOTE_DS_METHOD_NAMES = {"a"};
     private static final String[] SERVER_DS_METHOD_NAMES = {"a"};
 
-    /** 结构扫描上限（超过则跳过并记数，防启动期拖慢）。 */
-    private static final int SCAN_MAX_CANDIDATES = 4000;
+    /**
+     * 扫描跳过前缀：框架 / 三方命名空间（只为省时间）。
+     *
+     * <p>判据要求目标持 {@code RemoteEntry} 字段 ⇒ 这些命名空间下不可能有目标，
+     * 且应用自身命名空间（{@code com.mxtech.*}）与默认包短名**一律不在跳过列表内**。
+     * 跳过量在每个结果行里照数上报，不静默。
+     */
+    private static final String[] SKIP_PREFIXES = {
+            "java.", "javax.", "jdk.", "sun.", "dalvik.", "libcore.",
+            "android.", "androidx.", "kotlin.", "kotlinx.",
+            "com.google.", "com.android.internal.", "org.apache.", "org.jetbrains.",
+    };
 
-    /** 定位失败原因流水（只增不清，由调用方在打印后 {@link #resetDiag()}）。 */
+    /** 结构扫描硬时间预算：超时即报【未定】，绝不当「不存在」。 */
+    private static final long SCAN_BUDGET_MS = 30000L;
+
+    /** near-miss 记录条数上限。 */
+    private static final int NEAR_MISS_MAX = 10;
+
+    /** 定位失败原因流水（由调用方在打印后 {@link #resetDiag()}）。 */
     static final StringBuilder DIAG = new StringBuilder();
 
     static void diag(String line) {
@@ -88,16 +116,16 @@ final class HookTargets {
         }
     }
 
-    // ===== 定位：RemoteDataSource =====
+    // ===== 定位：快路径 =====
 
-    /** 定位 RemoteDataSource：持 RemoteEntry 字段 + 目录列举静态方法。 */
-    static Class<?> remoteDataSource(ClassLoader cl, Class<?> remoteEntryCls) {
+    /** 快路径：候选名 + 结构判据。 */
+    static Class<?> remoteDataSource(ClassLoader cl, Class<?> anchor) {
         for (String name : REMOTE_DS_NAMES) {
             Class<?> c = load(cl, name);
             if (c == null) {
                 continue;
             }
-            String why = remoteDsMismatch(c, remoteEntryCls);
+            String why = remoteDsMismatch(c, anchor);
             if (why == null) {
                 return c;
             }
@@ -106,56 +134,7 @@ final class HookTargets {
         return null;
     }
 
-    /**
-     * 结构扫描：不看名字，枚举 classloader 可见类名逐个套 RemoteDataSource 判据。
-     *
-     * <p>仅在快路径全部失败时调用（仅 debug 版）—— 命中即打印真名，供补进 {@link #REMOTE_DS_NAMES}。
-     */
-    static Class<?> scanRemoteDataSource(ClassLoader cl, Class<?> remoteEntryCls) {
-        List<String> names = enumClassNames(cl);
-        if (names == null) {
-            return null;
-        }
-        if (remoteEntryCls == null) {
-            diag("结构扫描跳过: 锚点 RemoteEntry 未取到，无法套判据");
-            return null;
-        }
-        boolean sawOldName = names.contains(REMOTE_DS_NAMES[0]);
-        // 关键诊断：枚举结果里到底有没有旧候选名 —— 唯一能区分
-        // 「设备上装的 APK 与静态分析的那份混淆映射不同」vs「类在、只是加载/判据环节有问题」的证据。
-        // 必须在命中判定**之前**打印（命中会提前 return，早前版本因此把它吞掉了）。
-        for (String cand : REMOTE_DS_NAMES) {
-            boolean in = names.contains(cand);
-            diag("旧候选名存在性: 枚举结果含 \"" + cand + "\" = " + in
-                    + (in ? "（类在 → 查判据/加载环节）" : "（类不在 → 设备上这版的混淆名与本文件常量不同）"));
-        }
-        int tried = 0;
-        int over = 0;
-        long t0 = System.nanoTime();
-        for (String n : names) {
-            if (!looksObfuscated(n)) {
-                continue;
-            }
-            if (tried >= SCAN_MAX_CANDIDATES) {
-                over++;
-                continue;
-            }
-            tried++;
-            Class<?> c = loadQuiet(cl, n);
-            if (c != null && remoteDsMismatch(c, remoteEntryCls) == null) {
-                diag("结构扫描命中: " + n + "（枚举 " + names.size() + " 个类名 / 比对 " + tried
-                        + " 个 / " + ms(t0) + " ms）");
-                return c;
-            }
-        }
-        diag("结构扫描无命中: 枚举 " + names.size() + " 个类名 / 比对 " + tried + " 个 / " + ms(t0) + " ms"
-                + (over > 0 ? "（超上限跳过 " + over + "）" : ""));
-        return null;
-    }
-
-    // ===== 定位：ServerDataSource =====
-
-    /** 定位 ServerDataSource：持 2×java.io.File 字段（服务器列表 JSON + 其 .tmp）。 */
+    /** 快路径：候选名 + 结构判据。 */
     static Class<?> serverDataSource(ClassLoader cl) {
         for (String name : SERVER_DS_NAMES) {
             Class<?> c = load(cl, name);
@@ -171,33 +150,149 @@ final class HookTargets {
         return null;
     }
 
-    // ===== 结构判据（只依赖类型关系）=====
+    // ===== 定位：结构扫描（debug 版兜底）=====
 
-    /** 判 RemoteDataSource 形态；符合返回 null，否则返回不符原因（供诊断日志）。 */
-    private static String remoteDsMismatch(Class<?> c, Class<?> remoteEntryCls) {
-        if (remoteEntryCls == null) {
-            return "锚点 RemoteEntry 未取到";
+    /** 结构扫描 RemoteDataSource：遍历给定类名全集，套「持锚点字段 + 列表方法」判据。 */
+    static Class<?> scanRemoteDataSource(ClassLoader cl, Class<?> anchor, List<String> names, String label) {
+        if (anchor == null) {
+            diag("结构扫描跳过: 锚点 " + CLS_REMOTE_ENTRY + " 未取到，无法套判据");
+            return null;
         }
-        boolean hasEntryField = false;
-        for (Field f : c.getDeclaredFields()) {
-            if (f.getType() == remoteEntryCls) {
-                hasEntryField = true;
+        if (names == null || names.isEmpty()) {
+            return null;
+        }
+        for (String cand : REMOTE_DS_NAMES) {
+            boolean in = names.contains(cand);
+            diag("候选名存在性: \"" + cand + "\" = " + in
+                    + (in ? "（类在 → 查判据/加载环节）" : "（不在 → 这一版的名字与常量表不同）"));
+        }
+        diag("锚点形态 " + anchor.getSimpleName() + ": " + describe(anchor));
+        return scanAll(cl, names, label, new Judge() {
+            @Override
+            public Class<?> visit(String name, Class<?> c, List<String> nearMiss) {
+                if (!hasAnchorField(c, anchor)) {
+                    return null;
+                }
+                if (directoryListMethod(c, REMOTE_DS_METHOD_NAMES) != null) {
+                    return c;
+                }
+                if (nearMiss.size() < NEAR_MISS_MAX) {
+                    nearMiss.add(name + " 持锚点字段但无列表方法（字段: " + fieldKinds(c)
+                            + "；static 方法: " + staticMethods(c) + "）");
+                }
+                return null;
+            }
+        });
+    }
+
+    /** 结构扫描 ServerDataSource：遍历给定类名全集，套「≥2 个 File 字段」判据。 */
+    static Class<?> scanServerDataSource(ClassLoader cl, List<String> names, String label) {
+        if (names == null || names.isEmpty()) {
+            return null;
+        }
+        for (String cand : SERVER_DS_NAMES) {
+            diag("候选名存在性: \"" + cand + "\" = " + names.contains(cand));
+        }
+        return scanAll(cl, names, label, new Judge() {
+            @Override
+            public Class<?> visit(String name, Class<?> c, List<String> nearMiss) {
+                int files = fileFieldCount(c);
+                if (files >= 2) {
+                    return c;
+                }
+                // near-miss：「只差一个 File 字段」是判据过严时唯一能救命的线索（别只剩一句无命中）
+                if (files == 1 && nearMiss.size() < NEAR_MISS_MAX) {
+                    nearMiss.add(name + " 仅 1 个 File 字段（字段: " + fieldKinds(c) + "）");
+                }
+                return null;
+            }
+        });
+    }
+
+    /** 扫描判据回调。 */
+    private interface Judge {
+        /** 返回命中的类；null = 继续。 */
+        Class<?> visit(String name, Class<?> c, List<String> nearMiss);
+    }
+
+    /**
+     * 全量扫描骨架（无条数上限，只有时间预算；超时报【未定】）。
+     *
+     * <p>三种结局都自述证据：命中 / 全量比完无命中 / 超时未定。
+     */
+    private static Class<?> scanAll(ClassLoader cl, List<String> names, String label, Judge judge) {
+        int skipped = 0;
+        int examined = 0;
+        int loaded = 0;
+        int loadFailed = 0;
+        boolean timedOut = false;
+        List<String> nearMiss = new ArrayList<>();
+        long t0 = System.nanoTime();
+        Class<?> hit = null;
+        for (String n : names) {
+            if (skipByPrefix(n)) {
+                skipped++;
+                continue;
+            }
+            if (System.nanoTime() - t0 > SCAN_BUDGET_MS * 1000000L) {
+                timedOut = true;
+                break;
+            }
+            examined++;
+            Class<?> c = loadQuiet(cl, n);
+            if (c == null) {
+                loadFailed++;
+                continue;
+            }
+            loaded++;
+            hit = judge.visit(n, c, nearMiss);
+            if (hit != null) {
                 break;
             }
         }
-        if (!hasEntryField) {
-            return "无 " + remoteEntryCls.getSimpleName() + " 类型字段（字段: " + fieldKinds(c) + "）";
+        String tail = "（枚举 " + names.size() + " / 跳过框架 " + skipped + " / 比对 " + examined
+                + " / 加载成功 " + loaded + " / 加载失败 " + loadFailed + " / " + ms(t0) + " ms）";
+        if (hit != null) {
+            diag(label + " 命中: " + hit.getName() + tail);
+        } else if (timedOut) {
+            diag(label + " 【未定】超时中断: 已比对 " + examined + " / 未比对 "
+                    + (names.size() - skipped - examined) + tail
+                    + " ⇒ 不能判定为「不存在」，需加大预算重扫");
+        } else {
+            diag(label + " 全量比完无命中" + tail);
         }
-        Method m = directoryListMethod(c, REMOTE_DS_METHOD_NAMES);
-        if (m == null) {
-            return "无目录列举方法（static + 返回 ArrayList + 唯一参数为自身）";
+        for (String s : nearMiss) {
+            diag(label + " near-miss: " + s);
+        }
+        return hit;
+    }
+
+    // ===== 结构判据（只依赖类型关系）=====
+
+    /** 判 RemoteDataSource 形态；符合返回 null，否则返回不符原因（供诊断日志）。 */
+    private static String remoteDsMismatch(Class<?> c, Class<?> anchor) {
+        if (anchor == null) {
+            return "锚点 RemoteEntry 未取到";
+        }
+        if (!hasAnchorField(c, anchor)) {
+            return "无 " + anchor.getSimpleName() + " 类型字段（字段: " + fieldKinds(c) + "）";
+        }
+        if (directoryListMethod(c, REMOTE_DS_METHOD_NAMES) == null) {
+            return "无列表方法（static + 返回 List + 唯一参数为自身）：static 方法 " + staticMethods(c);
         }
         return null;
     }
 
-    /** 结构判据（供结构扫描复用）：是否 ServerDataSource 形态。 */
-    static boolean serverDataSourceOf(Class<?> c) {
-        return c != null && serverDsMismatch(c) == null;
+    /** 持锚点类型字段（RemoteEntry 本身，或其父类 SmbServerEntry 声明）。 */
+    private static boolean hasAnchorField(Class<?> c, Class<?> anchor) {
+        Class<?> serverEntry = loadQuiet(c.getClassLoader(), CLS_SMB_SERVER_ENTRY);
+        for (Field f : c.getDeclaredFields()) {
+            Class<?> t = f.getType();
+            if (t == anchor || (serverEntry != null && t == serverEntry)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** 判 ServerDataSource 形态；符合返回 null，否则返回不符原因。 */
@@ -209,7 +304,7 @@ final class HookTargets {
     }
 
     /**
-     * 找目录列举方法：static + 返回 ArrayList + 唯一参数为自身类型。
+     * 找目录列举方法：static + 返回 List（ArrayList 亦满足）+ 唯一参数为自身类型。
      *
      * <p>按结构定位而非按方法名 —— 方法名也被混淆（1.93.4 为 {@code a}）。
      */
@@ -236,15 +331,22 @@ final class HookTargets {
     }
 
     /** 读服务器列表方法：static + 返回 List（读取 smb_list_data.json）。 */
-    static Method serverLoadMethod(Class<?> serverDsCls) {
+    static Method serverLoadMethod(Class<?> serverDsCls, String[] nameHints) {
         if (serverDsCls == null) {
             return null;
         }
+        for (String hint : nameHints) {
+            try {
+                Method m = serverDsCls.getDeclaredMethod(hint, serverDsCls);
+                if (isServerLoadShape(m, serverDsCls)) {
+                    return m;
+                }
+            } catch (Throwable ignored) {
+                // 继续按结构扫
+            }
+        }
         for (Method m : serverDsCls.getDeclaredMethods()) {
-            if (Modifier.isStatic(m.getModifiers())
-                    && m.getParameterCount() == 1
-                    && m.getParameterTypes()[0] == serverDsCls
-                    && List.class.isAssignableFrom(m.getReturnType())) {
+            if (isServerLoadShape(m, serverDsCls)) {
                 return m;
             }
         }
@@ -253,7 +355,14 @@ final class HookTargets {
 
     private static boolean isDirectoryListShape(Method m, Class<?> dsCls) {
         return Modifier.isStatic(m.getModifiers())
-                && m.getReturnType() == ArrayList.class
+                && List.class.isAssignableFrom(m.getReturnType())
+                && m.getParameterCount() == 1
+                && m.getParameterTypes()[0] == dsCls;
+    }
+
+    private static boolean isServerLoadShape(Method m, Class<?> dsCls) {
+        return Modifier.isStatic(m.getModifiers())
+                && List.class.isAssignableFrom(m.getReturnType())
                 && m.getParameterCount() == 1
                 && m.getParameterTypes()[0] == dsCls;
     }
@@ -268,14 +377,14 @@ final class HookTargets {
         return n;
     }
 
-    /** 字段类型摘要（仅用于诊断日志，形如 {@code RemoteEntry,d:ArrayList,k:Fn0}）。 */
-    private static String fieldKinds(Class<?> c) {
+    /** 字段类型摘要（诊断用，形如 {@code a:RemoteEntry,d:ArrayList}）。 */
+    static String fieldKinds(Class<?> c) {
         StringBuilder sb = new StringBuilder();
         for (Field f : c.getDeclaredFields()) {
             if (sb.length() > 0) {
                 sb.append(',');
             }
-            if (sb.length() > 120) {
+            if (sb.length() > 160) {
                 sb.append("…");
                 break;
             }
@@ -284,12 +393,64 @@ final class HookTargets {
         return sb.length() == 0 ? "(无)" : sb.toString();
     }
 
-    /** 混淆名候选形态：默认包（不含点）+ 短名 —— 只用来缩小结构扫描面。 */
-    private static boolean looksObfuscated(String name) {
-        return name.indexOf('.') < 0 && name.length() <= 6;
+    /** static 方法摘要（诊断用，形如 {@code a(Xy7):List}）。 */
+    static String staticMethods(Class<?> c) {
+        StringBuilder sb = new StringBuilder();
+        for (Method m : c.getDeclaredMethods()) {
+            if (!Modifier.isStatic(m.getModifiers())) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append(',');
+            }
+            if (sb.length() > 200) {
+                sb.append("…");
+                break;
+            }
+            sb.append(m.getName()).append('(');
+            Class<?>[] ps = m.getParameterTypes();
+            for (int i = 0; i < ps.length; i++) {
+                if (i > 0) {
+                    sb.append(',');
+                }
+                sb.append(ps[i].getSimpleName());
+            }
+            sb.append("):").append(m.getReturnType().getSimpleName());
+        }
+        return sb.length() == 0 ? "(无)" : sb.toString();
     }
 
-    // ===== classloader 内省（诊断 + 结构扫描数据源）=====
+    /** 类形态摘要：字段 + 方法名（诊断锚点用，判「这一版是否与静态分析同源」）。 */
+    static String describe(Class<?> c) {
+        if (c == null) {
+            return "null";
+        }
+        StringBuilder sb = new StringBuilder("字段[").append(fieldKinds(c)).append("] 方法[");
+        int n = 0;
+        for (Method m : c.getDeclaredMethods()) {
+            if (n++ > 0) {
+                sb.append(',');
+            }
+            if (sb.length() > 260) {
+                sb.append("…");
+                break;
+            }
+            sb.append(m.getName());
+        }
+        return sb.append(']').toString();
+    }
+
+    /** 是否框架/三方命名空间（跳过只为省时间；应用自身命名空间永不跳过）。 */
+    private static boolean skipByPrefix(String name) {
+        for (String p : SKIP_PREFIXES) {
+            if (name.startsWith(p)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ===== classloader 内省 =====
 
     /**
      * 枚举 classloader 可见的全部类名（走 DexPathList.dexElements[].dexFile.entries()）。
@@ -309,13 +470,11 @@ final class HookTargets {
                 return null;
             }
             TreeSet<String> out = new TreeSet<>();
-            int dexCount = 0;
             for (Object el : elements) {
                 Object dexFile = readField(el, "dexFile");
                 if (dexFile == null) {
                     continue;
                 }
-                dexCount++;
                 Object en = invoke(dexFile, "entries");
                 if (!(en instanceof Enumeration)) {
                     continue;
@@ -329,7 +488,7 @@ final class HookTargets {
                 }
             }
             if (out.isEmpty()) {
-                diag("枚举失败: " + dexCount + " 个 dex 均未取到类名");
+                diag("枚举失败: dex 元素均未取到类名");
                 return null;
             }
             return new ArrayList<>(out);
@@ -339,26 +498,88 @@ final class HookTargets {
         }
     }
 
-    /** classloader 的 dex 路径清单（判定「设备上装的是哪一份 APK」用）。 */
-    static String dexPaths(ClassLoader cl) {
+    /**
+     * dex 全景：逐个 dex 元素给出路径 + 该类名数（判「枚举是否覆盖全部 dex / 是否事后追加」）。
+     */
+    static String dexInventory(ClassLoader cl) {
         try {
             Object pathList = readField(cl, "pathList");
             Object[] elements = asArray(readField(pathList, "dexElements"));
             if (elements == null) {
                 return "?(取不到 dexElements)";
             }
-            StringBuilder sb = new StringBuilder();
+            StringBuilder sb = new StringBuilder("元素 ").append(elements.length).append(" 个:");
             for (Object el : elements) {
-                Object p = readField(el, "path");
-                if (p != null) {
-                    sb.append(p).append(' ');
+                String path = str(readField(el, "path"));
+                Object dexFile = readField(el, "dexFile");
+                int count = -1;
+                if (dexFile != null) {
+                    Object en = invoke(dexFile, "entries");
+                    if (en instanceof Enumeration) {
+                        count = 0;
+                        Enumeration<?> e = (Enumeration<?>) en;
+                        while (e.hasMoreElements()) {
+                            e.nextElement();
+                            count++;
+                        }
+                    }
                 }
+                sb.append("\n    ").append(count).append(" 个类  ").append(path);
             }
-            String s = sb.toString().trim();
-            return s.isEmpty() ? "?(元素无 path 字段)" : s;
+            return sb.toString();
         } catch (Throwable t) {
             return "?(" + t.getClass().getSimpleName() + ")";
         }
+    }
+
+    /** 名字含任一关键词的类名（triage：看清锚点邻域长什么样）。 */
+    static String namesLike(List<String> names, String[] needles, int max) {
+        if (names == null) {
+            return "?(无类名全集)";
+        }
+        StringBuilder sb = new StringBuilder();
+        int n = 0;
+        int total = 0;
+        for (String name : names) {
+            if (!hitAny(name, needles)) {
+                continue;
+            }
+            total++;
+            if (n++ >= max) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append(' ');
+            }
+            sb.append(name);
+        }
+        if (total == 0) {
+            return "(0 个)";
+        }
+        return total + " 个" + (total > n ? "（列前 " + n + "）" : "") + ": " + sb;
+    }
+
+    private static boolean hitAny(String name, String[] needles) {
+        for (String needle : needles) {
+            if (name.contains(needle)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 差集（新增的名字）。 */
+    static List<String> diff(List<String> before, List<String> after) {
+        List<String> out = new ArrayList<>();
+        if (after == null) {
+            return out;
+        }
+        for (String n : after) {
+            if (before == null || !before.contains(n)) {
+                out.add(n);
+            }
+        }
+        return out;
     }
 
     // ===== 反射小工具（沿父类链找字段，绕过隐藏 API 可见性）=====
@@ -402,6 +623,10 @@ final class HookTargets {
         } catch (Throwable t) {
             return null;
         }
+    }
+
+    private static String str(Object o) {
+        return o == null ? "?" : o.toString();
     }
 
     private static long ms(long t0) {

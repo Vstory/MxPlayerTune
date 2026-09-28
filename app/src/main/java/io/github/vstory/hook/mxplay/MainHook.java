@@ -6,6 +6,7 @@ import static android.util.Log.INFO;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.util.List;
 
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
@@ -29,12 +30,16 @@ import io.github.libxposed.api.XposedModuleInterface;
  * <p>日志分层（构建规范，填码时不得删 DEBUG）：
  * <ul>
  *   <li>INFO：模块加载 / onPackageReady / 定位结果 / hook 安装汇总 OK-FAIL —— release 也输出</li>
- *   <li>DEBUG：定位失败明细（含结构扫描）/ classloader dex 清单 / 每次拦截的参数与返回值 —— 仅 debug 构建
+ *   <li>DEBUG：定位明细（全量类名扫描 / near-miss / dex 清单 / 每次拦截的参数与返回值）—— 仅 debug 构建
  *       （{@code BuildConfig.DEBUG} 是编译期常量，release 整段裁剪）</li>
  * </ul>
  *
- * <p>定位失败的处理（多进程约定，见知识库 api102开发实战.md §5.5 / §23.4）：只有**主进程**的定位失败才是
- * 真失效（E 级）；子进程本就不加载目标类 → 打说明日志（I 级）后跳过，不报错、不影响 MX 原功能。
+ * <p>定位失败的两种性质（多进程约定，见知识库 api102开发实战.md §5.5 / §23.4）：
+ * 子进程本就不加载目标类 → I 级说明日志后跳过；主进程才是真失效（E 级）。
+ *
+ * <p>全量结构扫描为何放<b>后台线程</b>：类加载会级联加载父类，耗时不可预判；
+ * 扫描可能达数秒，放 onPackageReady 主线程会拖慢目标 App 启动。扫描只读、且命中后才装 hook，
+ * 故放后台安全。
  */
 public class MainHook extends XposedModule {
 
@@ -43,18 +48,28 @@ public class MainHook extends XposedModule {
     /** 被 hook 的目标应用包名（与 META-INF/xposed/scope.list 一致）。 */
     private static final String TARGET_PKG = "com.mxtech.videoplayer.pro";
 
+    /** 快路径未命中后，二次枚举的延迟（抓「启动后才追加 dex」的动态加载）。 */
+    private static final long RESCAN_DELAY_MS = 5000L;
+
+    /** triage 关键词：列出这些词相关的类名，看清锚点邻域。 */
+    private static final String[] TRIAGE_NEEDLES = {
+            "smb", "Smb", "Remote", "DataSource", "Dav", "dav", "Server", "server",
+    };
+
     private static int sHookOk;
     private static int sHookFail;
     private static final StringBuilder DETAIL = new StringBuilder();
 
-    /** 本进程名（onModuleLoaded 记录）：用于区分主进程 / 子进程，决定定位失败该报 E 还是 I。 */
+    /** 本进程名（onModuleLoaded 记录）：区分主进程 / 子进程，决定定位失败该报 E 还是 I。 */
     private static String sProcessName;
 
     /** 目标应用版本串（懒取，只打日志用；取不到不致命）。 */
     private static String sTargetVersion;
 
-    /** 定位到的目标类（供 hooker 回调复用）。 */
+    /** 定位与 hook 上下文（后台线程复用）。 */
+    private static ClassLoader sCl;
     private static Class<?> sRemoteEntryCls;
+    private static Class<?> sSmbServerCls;
     private static Class<?> sRemoteDsCls;
 
     public MainHook() {
@@ -89,6 +104,7 @@ public class MainHook extends XposedModule {
     // ===== hook 安装 =====
 
     private void installHooks(ClassLoader cl) {
+        sCl = cl;
         sHookOk = 0;
         sHookFail = 0;
         DETAIL.setLength(0);
@@ -96,72 +112,113 @@ public class MainHook extends XposedModule {
 
         // ---- 定位目标（失败即 no-op，不影响 MX 原功能）----
         sRemoteEntryCls = HookTargets.loadQuiet(cl, HookTargets.CLS_REMOTE_ENTRY);
-        Class<?> smbServerCls = HookTargets.loadQuiet(cl, HookTargets.CLS_SMB_SERVER_ENTRY);
+        sSmbServerCls = HookTargets.loadQuiet(cl, HookTargets.CLS_SMB_SERVER_ENTRY);
         sRemoteDsCls = HookTargets.remoteDataSource(cl, sRemoteEntryCls);
         Class<?> serverDsCls = HookTargets.serverDataSource(cl);
-
-        // 快路径（候选混淆名）全失手 → 结构扫描兜底：不看名字，按判据全 dex 找。
-        // 仅 debug 版执行（release 依赖上面的候选名常量表，避免每次启动的枚举开销）。
-        if (sRemoteDsCls == null && BuildConfig.DEBUG) {
-            sRemoteDsCls = HookTargets.scanRemoteDataSource(cl, sRemoteEntryCls);
-        }
-        if (serverDsCls == null && sRemoteDsCls != null && BuildConfig.DEBUG) {
-            serverDsCls = scanServerDataSource(cl);
-        }
 
         log(INFO, TAG, "[locate] process=" + sProcessName + " target=" + TARGET_PKG + " "
                 + versionLabel()
                 + " RemoteEntry=" + name(sRemoteEntryCls)
-                + " SmbServerEntry=" + name(smbServerCls)
+                + " SmbServerEntry=" + name(sSmbServerCls)
                 + " RemoteDataSource=" + name(sRemoteDsCls)
                 + " ServerDataSource=" + name(serverDsCls));
 
-        if (BuildConfig.DEBUG) {
-            log(DEBUG, TAG, "[DBG] [locate] classLoader dexPaths=" + HookTargets.dexPaths(cl));
-        }
-
-        if (sRemoteDsCls == null) {
-            // 主进程 = 真失效（E 级，须修）；子进程 = 本就不加载目标类，属正常（I 级说明日志，勿报错）
-            boolean main = isMainProcess();
-            log(main ? ERROR : INFO, TAG, "[locate] 未找到目标类 → 模块 no-op（MX 原功能不受影响）"
-                    + (main ? "；本进程为主进程，需按下方明细补新混淆名" : "；本进程非主进程，多进程下正常"));
-            if (BuildConfig.DEBUG) {
-                log(DEBUG, TAG, "[DBG] [locate] 失败明细:\n" + HookTargets.DIAG);
-            }
+        if (sRemoteDsCls != null) {
+            installFor(serverDsCls);
             return;
         }
 
-        // ---- hook ①：目录列举（阶段 A：仅探针日志；阶段 B 接入 PROPFIND）----
+        if (!BuildConfig.DEBUG) {
+            // release 不跑全量扫描（候选名常量表才是 release 的定位手段）
+            boolean main = isMainProcess();
+            log(main ? ERROR : INFO, TAG, "[locate] 快路径未命中 → 模块 no-op（MX 原功能不受影响）"
+                    + (main ? "；本进程为主进程，需装 debug 版跑全量扫描补齐候选名" : "；本进程非主进程，多进程下正常"));
+            return;
+        }
+
+        log(INFO, TAG, "[locate] 快路径未命中 → 后台全量结构扫描（debug 版兜底）");
+        Thread t = new Thread(this::backgroundScan, "MxPlayerTune-locate");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    // ===== 后台全量结构扫描（debug 版）=====
+
+    /**
+     * 不看名字，遍历 classloader 全部类名套结构判据；若仍无命中，延迟二次枚举抓「事后追加的 dex」。
+     */
+    private void backgroundScan() {
+        ClassLoader cl = sCl;
+        try {
+            log(DEBUG, TAG, "[DBG] [locate] dex 清单: " + HookTargets.dexInventory(cl));
+
+            List<String> names = HookTargets.enumClassNames(cl);
+            if (names == null) {
+                flushDiag("全量扫描");
+                log(ERROR, TAG, "[locate] 类名枚举失败 → 无法扫描（明细见上）");
+                return;
+            }
+            log(DEBUG, TAG, "[DBG] [locate] 枚举类名 " + names.size() + " 个");
+
+            Class<?> ds = HookTargets.scanRemoteDataSource(cl, sRemoteEntryCls, names, "RemoteDataSource");
+            Class<?> serverDs = HookTargets.scanServerDataSource(cl, names, "ServerDataSource");
+
+            if (ds != null) {
+                sRemoteDsCls = ds;
+                flushDiag("全量扫描");
+                installFor(serverDs);
+                return;
+            }
+
+            flushDiag("全量扫描");
+
+            // ---- 二次枚举：抓启动后才追加的 dex（动态加载 / 懒加载模块）----
+            Thread.sleep(RESCAN_DELAY_MS);
+            List<String> after = HookTargets.enumClassNames(cl);
+            List<String> delta = HookTargets.diff(names, after);
+            log(DEBUG, TAG, "[DBG] [locate] 二次枚举（+" + (RESCAN_DELAY_MS / 1000) + "s）: 类名 "
+                    + names.size() + " → " + (after == null ? "?" : after.size()) + "，新增 " + delta.size());
+            if (after != null && !delta.isEmpty()) {
+                Class<?> ds2 = HookTargets.scanRemoteDataSource(cl, sRemoteEntryCls, delta, "RemoteDataSource(二次)");
+                Class<?> serverDs2 = HookTargets.scanServerDataSource(cl, delta, "ServerDataSource(二次)");
+                flushDiag("二次扫描");
+                if (ds2 != null) {
+                    sRemoteDsCls = ds2;
+                    installFor(serverDs2 != null ? serverDs2 : serverDs);
+                    return;
+                }
+            }
+
+            // ---- 仍无命中：把「为什么」讲清楚，别只留一个 null ----
+            boolean main = isMainProcess();
+            log(main ? ERROR : INFO, TAG, "[locate] 全量扫描无命中 → 模块 no-op（MX 原功能不受影响）"
+                    + (main ? "；本进程为主进程，需按上方明细（near-miss / triage）判断是判据失手还是类不在" : "；本进程非主进程，多进程下正常"));
+            log(DEBUG, TAG, "[DBG] [locate] 【结论性证据】锚点邻域与 near-miss 见上；"
+                    + "若 triage 里没有锚点包（" + HookTargets.ANCHOR_PKG + "）以外的可疑类且无 near-miss，"
+                    + "说明目标类不在已加载 dex 中");
+        } catch (Throwable t) {
+            log(ERROR, TAG, "[ERR] 后台扫描异常: " + t, t);
+        }
+    }
+
+    private void flushDiag(String phase) {
+        if (HookTargets.DIAG.length() > 0) {
+            log(DEBUG, TAG, "[DBG] [locate] " + phase + "明细:\n" + HookTargets.DIAG);
+        }
+    }
+
+    /** 装 hook（定位成功后统一走这里）。 */
+    private void installFor(Class<?> serverDsCls) {
         Method listMethod = HookTargets.directoryListMethod(sRemoteDsCls, new String[]{"a"});
         hookDirectoryList(listMethod);
 
         log(INFO, TAG, "installHooks done: " + sHookOk + " OK / " + sHookFail + " FAIL" + DETAIL);
-        if (BuildConfig.DEBUG && HookTargets.DIAG.length() > 0) {
-            log(DEBUG, TAG, "[DBG] [locate] 明细（含已修复的失手候选）:\n" + HookTargets.DIAG);
+        if (BuildConfig.DEBUG) {
+            log(DEBUG, TAG, "[DBG] [locate] 最终定位: RemoteEntry=" + name(sRemoteEntryCls)
+                    + " SmbServerEntry=" + name(sSmbServerCls)
+                    + " RemoteDataSource=" + name(sRemoteDsCls)
+                    + " ServerDataSource=" + name(serverDsCls));
         }
-    }
-
-    /** 结构扫描兜底：ServerDataSource（数据源 + 诊断真名）。 */
-    private Class<?> scanServerDataSource(ClassLoader cl) {
-        java.util.List<String> names = HookTargets.enumClassNames(cl);
-        if (names == null) {
-            return null;
-        }
-        int tried = 0;
-        long t0 = System.nanoTime();
-        for (String n : names) {
-            if (n.indexOf('.') >= 0 || n.length() > 6) {
-                continue;
-            }
-            tried++;
-            Class<?> c = HookTargets.loadQuiet(cl, n);
-            if (c != null && HookTargets.serverDataSourceOf(c)) {
-                HookTargets.diag("结构扫描命中(ServerDataSource): " + n + "（比对 " + tried + " 个 / "
-                        + (System.nanoTime() - t0) / 1000000L + " ms）");
-                return c;
-            }
-        }
-        return null;
     }
 
     // ===== 工具 =====
