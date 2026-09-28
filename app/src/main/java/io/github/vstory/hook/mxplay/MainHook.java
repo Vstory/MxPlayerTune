@@ -20,13 +20,17 @@ import io.github.libxposed.api.XposedModuleInterface;
  *
  * <p>目标：让 MX Player 的「本地网络」在 SMB 之外支持 WebDAV。
  *
- * <p>两个 hook（详见知识库 项目开发记录/io.github.vstory.hook.mxplay/）：
+ * <p>三个 hook（详见知识库 项目开发记录/io.github.vstory.hook.mxplay/）：
  * <ol>
  *   <li>{@code SmbServerEntry#getRootPath()} —— webdav 服务器算出来的 rootPath 带着硬编码的
- *       {@code smb://} 前缀，读侧归一（{@code smb://http://…} → {@code http://…}），
- *       使 {@code RemoteEntry.path} 直接是 WebDAV URL（下游播放链路协议无关）</li>
+ *       {@code smb://} 前缀，读侧归一（{@code smb://http://…} → {@code http://…}）
+ *       <b>并把凭据内联成 URL userinfo</b>（{@code http://用户:密码@主机:端口/路径}）：
+ *       MX 播放前用 {@code wJ.c(uri)} 把 {@code uri.getUserInfo()} 变成
+ *       {@code Authorization: Basic …} 选项 —— URL 里没有 userinfo 就等于播放不带鉴权</li>
  *   <li>RemoteDataSource 的目录列举静态方法 —— path 为 http(s) 时走 PROPFIND 列目录，
  *       否则原样放行（SMB 功能不受影响）</li>
+ *   <li>{@code SmbUtil} 的缩略图 URL 构造方法 —— 对 http(s) 直接返回条目 {@code path}
+ *       （MX 自己重建 URL 时用 {@code getHost()+getPath()} ⇒ 丢端口，非 80/443 必然拿不到缩略图）</li>
  * </ol>
  *
  * <p>生命周期：onModuleLoaded → onPackageReady → installHooks
@@ -71,6 +75,7 @@ public class MainHook extends XposedModule {
     private static Class<?> sRemoteEntryCls;
     private static Class<?> sSmbServerCls;
     private static Class<?> sRemoteDsCls;
+    private static Class<?> sSmbUtilCls;
 
     public MainHook() {
         super();
@@ -164,6 +169,9 @@ public class MainHook extends XposedModule {
 
             Class<?> ds = HookTargets.scanRemoteDataSource(cl, sRemoteEntryCls, names, "RemoteDataSource");
             Class<?> serverDs = HookTargets.scanServerDataSource(cl, names, "ServerDataSource");
+            if (sSmbUtilCls == null) {
+                sSmbUtilCls = HookTargets.scanSmbUtil(cl, sRemoteEntryCls, names, "SmbUtil");
+            }
 
             if (ds != null) {
                 sRemoteDsCls = ds;
@@ -217,7 +225,7 @@ public class MainHook extends XposedModule {
 
     /** 装 hook（定位成功后统一走这里）。 */
     private void installFor(Class<?> serverDsCls) {
-        // hook ①：rootPath 读侧归一（webdav 去掉 smb:// 前缀）
+        // hook ①：rootPath 读侧归一（webdav 去 smb:// 前缀 + 凭据内联进 URL）
         hookRootPath(HookTargets.rootPathGetter(sSmbServerCls, HookTargets.M_SMB_GET_ROOT_PATH));
 
         // hook ②：目录列举（http(s) → PROPFIND）
@@ -228,12 +236,19 @@ public class MainHook extends XposedModule {
         }
         hookDirectoryList(HookTargets.directoryListMethod(sRemoteDsCls, new String[]{"a"}), bound);
 
+        // hook ③：缩略图 URL 构造（http(s) 直接用条目 path，避免 MX 丢端口）
+        if (sSmbUtilCls == null) {
+            sSmbUtilCls = HookTargets.smbUtil(sCl, sRemoteEntryCls);
+        }
+        hookThumbnailUrl(HookTargets.smbUtilBuildUrl(sSmbUtilCls));
+
         log(INFO, TAG, "installHooks done: " + sHookOk + " OK / " + sHookFail + " FAIL" + DETAIL);
         if (BuildConfig.DEBUG) {
             log(DEBUG, TAG, "[DBG] [locate] 最终定位: RemoteEntry=" + name(sRemoteEntryCls)
                     + " SmbServerEntry=" + name(sSmbServerCls)
                     + " RemoteDataSource=" + name(sRemoteDsCls)
-                    + " ServerDataSource=" + name(serverDsCls));
+                    + " ServerDataSource=" + name(serverDsCls)
+                    + " SmbUtil=" + name(sSmbUtilCls));
         }
     }
 
@@ -252,12 +267,17 @@ public class MainHook extends XposedModule {
                 @Override
                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
                     Object raw = chain.proceed();
-                    String fixed = RemoteEntries.normalizeRootPath(raw instanceof String ? (String) raw : null);
+                    String rawStr = raw instanceof String ? (String) raw : null;
+                    String[] cred = credentialsOf(chain.getThisObject());
+                    String fixed = RemoteEntries.normalizeRootPath(rawStr, cred[0], cred[1]);
                     if (BuildConfig.DEBUG) {
                         if (fixed != null && !fixed.equals(raw)) {
-                            log(DEBUG, TAG, "[DBG] >> " + desc + " 归一: " + raw + " → " + fixed);
+                            log(DEBUG, TAG, "[DBG] >> " + desc + " 归一: "
+                                    + RemoteEntries.maskUserInfo(rawStr) + " → "
+                                    + RemoteEntries.maskUserInfo(fixed));
                         } else {
-                            log(DEBUG, TAG, "[DBG] >> " + desc + " 原样: " + raw);
+                            log(DEBUG, TAG, "[DBG] >> " + desc + " 原样: "
+                                    + RemoteEntries.maskUserInfo(rawStr));
                         }
                     }
                     return fixed;
@@ -272,6 +292,22 @@ public class MainHook extends XposedModule {
                 log(DEBUG, TAG, "[DBG] hook FAIL: " + desc + " -> " + t);
             }
         }
+    }
+
+    /**
+     * 条目凭据（{@code {user, pass}}，真凭据，空串 = 匿名/无）。
+     *
+     * <p>真机事实：{@code ServerEditDialog} 落库时对 userName/password {@code Uri.encode} 过
+     * ⇒ 这里 {@code Uri.decode} 还原（服务端要的是真凭据）；{@code anonymity != 0} 表示匿名勾选，
+     * 此时 MX 自己也只送匿名，凭据一律不带。
+     */
+    private static String[] credentialsOf(Object entry) {
+        if (entry == null || RemoteEntries.readIntField(entry, "anonymity", 1) != 0) {
+            return new String[]{"", ""};
+        }
+        return new String[]{
+                Uri.decode(nullToEmpty(RemoteEntries.readOwnField(entry, "userName"))),
+                Uri.decode(nullToEmpty(RemoteEntries.readOwnField(entry, "password")))};
     }
 
     // ===== hook ②：RemoteDataSource 目录列举 =====
@@ -293,12 +329,14 @@ public class MainHook extends XposedModule {
                     String path = entry == null ? null : RemoteEntries.pathOf(entry);
                     if (!HookTargets.isHttpUrl(path)) {
                         if (BuildConfig.DEBUG) {
-                            log(DEBUG, TAG, "[DBG] >> " + desc + " 非 http(s) → 放行 path=" + path);
+                            log(DEBUG, TAG, "[DBG] >> " + desc + " 非 http(s) → 放行 path="
+                                    + RemoteEntries.maskUserInfo(path));
                         }
                         return chain.proceed();
                     }
                     if (!entryCtorBound) {
-                        log(ERROR, TAG, "[webdav] 条目构造器未绑定 → 无法列出 " + path);
+                        log(ERROR, TAG, "[webdav] 条目构造器未绑定 → 无法列出 "
+                                + RemoteEntries.maskUserInfo(path));
                         return new ArrayList<Object>();
                     }
                     return listWebDav(chain, entry, path, desc);
@@ -341,7 +379,7 @@ public class MainHook extends XposedModule {
                 }
             }
             long ms = (System.nanoTime() - t0) / 1_000_000L;
-            log(INFO, TAG, "[webdav] " + desc + " path=" + path
+            log(INFO, TAG, "[webdav] " + desc + " path=" + RemoteEntries.maskUserInfo(path)
                     + (reqUrl.equals(path) ? "" : " → req=" + reqUrl)
                     + " → 子项 " + children.size() + "（目录 " + dirs + "）"
                     + " 过滤=" + filter.kind() + " 返回 " + out.size() + " 项 / " + ms + " ms"
@@ -359,14 +397,16 @@ public class MainHook extends XposedModule {
                         sb.append('…');
                         break;
                     }
-                    sb.append(RemoteEntries.pathOf(o)).append('(').append(RemoteEntries.typeOf(o)).append(')');
+                    sb.append(RemoteEntries.maskUserInfo(RemoteEntries.pathOf(o)))
+                            .append('(').append(RemoteEntries.typeOf(o)).append(')');
                 }
                 log(DEBUG, TAG, "[DBG] << " + desc + " 返回: " + sb);
             }
             return out;
         } catch (Throwable t) {
             long ms = (System.nanoTime() - t0) / 1_000_000L;
-            log(ERROR, TAG, "[webdav] 列目录失败 path=" + path + " / " + ms + " ms: " + t, t);
+            log(ERROR, TAG, "[webdav] 列目录失败 path=" + RemoteEntries.maskUserInfo(path)
+                    + " / " + ms + " ms: " + t, t);
             if (BuildConfig.DEBUG) {
                 log(DEBUG, TAG, "[DBG] [webdav] 失败明细:\n" + WebDavClient.NOTES);
             }
@@ -374,6 +414,54 @@ public class MainHook extends XposedModule {
         } finally {
             if (filter != null) {
                 filter.close();
+            }
+        }
+    }
+
+    // ===== hook ③：SmbUtil 缩略图 URL 构造 =====
+
+    /** 本 hook 的 DEBUG 明细只打前几次（列表页每次滚动都会调它，逐行打会淹掉日志）。 */
+    private static final int THUMB_LOG_MAX = 3;
+    private static int sThumbLogged;
+
+    /**
+     * MX 生成缩略图 URL 时用 {@code uri.getHost() + uri.getPath()} 重建（丢端口、凭据取字段原值）。
+     *
+     * <p>对 http(s) 条目直接用条目自己的 {@code path}：端口在、凭据在（hook ① 内联），
+     * 且这正是 MX 交给图片加载器的那串 URL。非 http(s) 一律放行（SMB 行为不变）。
+     */
+    private void hookThumbnailUrl(Method target) {
+        final String desc = "SmbUtil#buildThumbUrl";
+        if (target == null) {
+            sHookFail++;
+            DETAIL.append("\n[FAIL] ").append(desc).append(": method not found");
+            return;
+        }
+        try {
+            target.setAccessible(true);
+            hook(target).intercept(new XposedInterface.Hooker() {
+                @Override
+                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    Object entry = chain.getArg(0);
+                    String path = RemoteEntries.pathOf(entry);
+                    if (!HookTargets.isHttpUrl(path)) {
+                        return chain.proceed();
+                    }
+                    if (BuildConfig.DEBUG && sThumbLogged < THUMB_LOG_MAX) {
+                        sThumbLogged++;
+                        log(DEBUG, TAG, "[DBG] >> " + desc + " 改用条目 path="
+                                + RemoteEntries.maskUserInfo(path));
+                    }
+                    return path;
+                }
+            });
+            sHookOk++;
+            DETAIL.append("\n[OK] ").append(desc);
+        } catch (Throwable t) {
+            sHookFail++;
+            DETAIL.append("\n[FAIL] ").append(desc).append(": ").append(t);
+            if (BuildConfig.DEBUG) {
+                log(DEBUG, TAG, "[DBG] hook FAIL: " + desc + " -> " + t);
             }
         }
     }

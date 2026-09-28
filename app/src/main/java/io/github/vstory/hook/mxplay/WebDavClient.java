@@ -17,9 +17,13 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 import javax.xml.parsers.DocumentBuilderFactory;
 
 import org.w3c.dom.Document;
@@ -61,6 +65,9 @@ final class WebDavClient {
 
     /** 诊断流水（调用方打印后 {@link #resetNotes()}），记录「走的哪条请求路径」等。 */
     static final StringBuilder NOTES = new StringBuilder();
+
+    /** https 宽松校验的 Socket 工厂（懒建；null = 不可用，退回严格校验）。 */
+    private static SSLSocketFactory sRelaxFactory;
 
     static void note(String line) {
         NOTES.append("  ").append(line).append('\n');
@@ -133,6 +140,67 @@ final class WebDavClient {
         }
     }
 
+    /**
+     * 放宽 https 的证书校验（**仅本模块的 PROPFIND 用**）。
+     *
+     * <p>为什么需要：自建 WebDAV（群晖 / Alist / nginx 自签 / 私有 CA）几乎都不是受信证书，
+     * 默认校验下 {@code PROPFIND} 直接 {@code SSLHandshakeException: Trust anchor for
+     * certification path not found} ⇒ 列目录全灭（真机日志原样如此）。
+     *
+     * <p>纪律：只设到<b>本条连接</b>上（{@code setSSLSocketFactory} / 返回专用 Socket），
+     * 绝不碰 {@code HttpsURLConnection.setDefaultSSLSocketFactory} —— 那会把整个 MX 进程的
+     * 证书校验一起废掉。宽松校验初始化失败时返回 null，调用方退回严格校验。
+     *
+     * <p>范围限制：只影响「浏览/列目录」。播放与缩略图走 MX 自带的 FFmpeg，证书校验在它那边
+     * （本模块管不到）⇒ 自签名 https 上播放仍可能失败，请用 http 或受信证书。
+     */
+    private static SSLSocketFactory relaxFactory() {
+        if (sRelaxFactory == null) {
+            try {
+                SSLContext ctx = SSLContext.getInstance("TLS");
+                ctx.init(null, new TrustManager[]{new X509TrustManager() {
+                    @Override
+                    public void checkClientTrusted(java.security.cert.X509Certificate[] chain, String authType) {
+                    }
+
+                    @Override
+                    public void checkServerTrusted(java.security.cert.X509Certificate[] chain, String authType) {
+                    }
+
+                    @Override
+                    public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+                        return new java.security.cert.X509Certificate[0];
+                    }
+                }}, new java.security.SecureRandom());
+                sRelaxFactory = ctx.getSocketFactory();
+            } catch (Throwable t) {
+                note("https 宽松校验初始化失败（" + t + "）→ 退回严格校验");
+                return null;
+            }
+        }
+        return sRelaxFactory;
+    }
+
+    /** https 连接套用宽松校验（含主机名）；http 原样返回。 */
+    private static void relaxTls(HttpURLConnection conn) {
+        if (!(conn instanceof HttpsURLConnection)) {
+            return;
+        }
+        SSLSocketFactory f = relaxFactory();
+        if (f == null) {
+            return;
+        }
+        HttpsURLConnection https = (HttpsURLConnection) conn;
+        https.setSSLSocketFactory(f);
+        https.setHostnameVerifier(new javax.net.ssl.HostnameVerifier() {
+            @Override
+            public boolean verify(String hostname, javax.net.ssl.SSLSession session) {
+                return true;
+            }
+        });
+        note("https: 已放宽证书校验（自签名 / 私有 CA 可用；仅本条连接）");
+    }
+
     /** 凭据来源：显式参数优先，其次 URL 里的 userinfo（两种都按 RFC 7617 走 Authorization 头）。 */
     private static String authOf(String rawUrl, String user, String pass) {
         if (user != null && !user.isEmpty()) {
@@ -170,6 +238,7 @@ final class WebDavClient {
             if (auth != null) {
                 conn.setRequestProperty("Authorization", auth);
             }
+            relaxTls(conn);
             conn.setFixedLengthStreamingMode(body.length);
             conn.setDoOutput(true);
             OutputStream out = conn.getOutputStream();
@@ -201,10 +270,16 @@ final class WebDavClient {
         Socket socket = null;
         try {
             if (tls) {
-                SSLSocket ssl = (SSLSocket) SSLSocketFactory.getDefault().createSocket(host, port);
-                SSLParameters p = ssl.getSSLParameters();
-                p.setEndpointIdentificationAlgorithm("HTTPS");
-                ssl.setSSLParameters(p);
+                SSLSocketFactory f = relaxFactory();
+                SSLSocket ssl = (SSLSocket) (f != null ? f : SSLSocketFactory.getDefault()).createSocket(host, port);
+                if (f == null) {
+                    // 宽松校验不可用时保持严格的 HTTPS 主机名校验（宁可报错也不静默降级）
+                    SSLParameters p = ssl.getSSLParameters();
+                    p.setEndpointIdentificationAlgorithm("HTTPS");
+                    ssl.setSSLParameters(p);
+                } else {
+                    note("https: 已放宽证书校验（自签名 / 私有 CA 可用；仅本条连接）");
+                }
                 ssl.startHandshake();
                 socket = ssl;
             } else {

@@ -73,6 +73,20 @@ final class HookTargets {
     private static final String[] SERVER_DS_METHOD_NAMES = {"a"};
 
     /**
+     * 缩略图 URL 构造器候选混淆名（1.93.4 真机实测 = {@code hr0}，source 名 SmbUtil.java）。
+     *
+     * <p>为什么需要它：MX 自己重建缩略图 URL 时用 {@code uri.getHost() + uri.getPath()}
+     * ⇒ <b>端口被丢掉</b>（非 80/443 的 WebDAV 必然拿不到缩略图）。结构判据见
+     * {@link #smbUtilMismatch}：纯静态工具类（无字段）+ 一个 {@code (RemoteEntry)String} +
+     * 一个 {@code (ImageView,String,int,int,Drawable)V}。
+     */
+    private static final String[] SMB_UTIL_NAMES = {"hr0"};
+
+    /** SmbUtil 判据里用到的两个参数类型名（按名字比对 ⇒ 无需 import Android 类，离机也能验证）。 */
+    private static final String CLS_IMAGE_VIEW = "android.widget.ImageView";
+    private static final String CLS_DRAWABLE = "android.graphics.drawable.Drawable";
+
+    /**
      * 扫描跳过前缀：框架 / 三方命名空间（只为省时间）。
      *
      * <p>判据要求目标持 {@code RemoteEntry} 字段 ⇒ 这些命名空间下不可能有目标，
@@ -205,6 +219,104 @@ final class HookTargets {
                 return c;
             }
             diag(name + " → 结构不符: " + why);
+        }
+        return null;
+    }
+
+    // ===== 定位：SmbUtil（缩略图 URL 构造器，hook ③）=====
+
+    /** 快路径：候选混淆名 + 结构判据。 */
+    static Class<?> smbUtil(ClassLoader cl, Class<?> anchor) {
+        for (String name : SMB_UTIL_NAMES) {
+            Class<?> c = load(cl, name);
+            if (c == null) {
+                continue;
+            }
+            String why = smbUtilMismatch(c, anchor);
+            if (why == null) {
+                return c;
+            }
+            diag(name + " → 结构不符: " + why);
+        }
+        return null;
+    }
+
+    /** 结构扫描 SmbUtil：不看名字，套「纯静态工具类」判据。 */
+    static Class<?> scanSmbUtil(ClassLoader cl, Class<?> anchor, List<String> names, String label) {
+        if (anchor == null || names == null || names.isEmpty()) {
+            return null;
+        }
+        for (String cand : SMB_UTIL_NAMES) {
+            diag("候选名存在性: \"" + cand + "\" = " + names.contains(cand));
+        }
+        return scanAll(cl, names, label, new Judge() {
+            @Override
+            public Class<?> visit(String name, Class<?> c, List<String> nearMiss) {
+                String why = smbUtilMismatch(c, anchor);
+                if (why == null) {
+                    return c;
+                }
+                // 只对「像工具类」的类报 near-miss，否则 1.5 万个类里全是噪音
+                if (c.getDeclaredFields().length == 0 && nearMiss.size() < NEAR_MISS_MAX) {
+                    String sig = staticMethods(c);
+                    if (sig.contains(anchor.getSimpleName()) || sig.contains("ImageView")) {
+                        nearMiss.add(name + " 纯静态但形态不符: " + why);
+                    }
+                }
+                return null;
+            }
+        });
+    }
+
+    /** 判 SmbUtil 形态；符合返回 null，否则返回不符原因（供诊断日志）。 */
+    static String smbUtilMismatch(Class<?> c, Class<?> anchor) {
+        if (c == null) {
+            return "类未取到";
+        }
+        if (anchor == null) {
+            return "锚点 RemoteEntry 未取到";
+        }
+        if (c.getDeclaredFields().length != 0) {
+            return "有 " + c.getDeclaredFields().length + " 个字段（纯静态工具类应无字段）";
+        }
+        Method url = null;
+        Method view = null;
+        for (Method m : c.getDeclaredMethods()) {
+            if (!Modifier.isStatic(m.getModifiers())) {
+                continue;
+            }
+            if (m.getReturnType() == String.class && m.getParameterCount() == 1
+                    && m.getParameterTypes()[0] == anchor) {
+                url = m;
+            } else if (m.getReturnType() == void.class && m.getParameterCount() == 5
+                    && CLS_IMAGE_VIEW.equals(m.getParameterTypes()[0].getName())
+                    && m.getParameterTypes()[1] == String.class
+                    && m.getParameterTypes()[2] == int.class
+                    && m.getParameterTypes()[3] == int.class
+                    && CLS_DRAWABLE.equals(m.getParameterTypes()[4].getName())) {
+                view = m;
+            }
+        }
+        if (url == null) {
+            return "无 static (RemoteEntry)String（static 方法: " + staticMethods(c) + "）";
+        }
+        if (view == null) {
+            return "无 static (ImageView,String,int,int,Drawable)V（缩略图加载入口；static 方法: "
+                    + staticMethods(c) + "）";
+        }
+        return null;
+    }
+
+    /** 取 SmbUtil 的 URL 构造方法 {@code (RemoteEntry)String}。 */
+    static Method smbUtilBuildUrl(Class<?> cls) {
+        if (cls == null) {
+            return null;
+        }
+        for (Method m : cls.getDeclaredMethods()) {
+            if (Modifier.isStatic(m.getModifiers()) && m.getReturnType() == String.class
+                    && m.getParameterCount() == 1) {
+                return m;
+            }
         }
         return null;
     }

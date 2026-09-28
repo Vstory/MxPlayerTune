@@ -326,7 +326,8 @@ jobs:
           - 签名方案：\`${SIGN_SCHEMES:-（未读取到）}\`
           - 两个包**同包名**，不能同时安装（后装的覆盖先装的）
           - 目标应用：MX Player Pro \`com.mxtech.videoplayer.pro\`（作用域已静态声明，无需手动勾选）
-          - 当前功能状态：**阶段 A（探针）** —— 仅验证模块注入与目标定位，尚未实现 WebDAV 浏览
+          - 当前功能状态：**阶段 B（浏览可用）** —— 本地网络里填 `http(s)://主机:端口/路径` + 账号密码即可浏览 WebDAV 目录；
+            播放与缩略图的凭据由模块内联进 URL（MX 靠它生成 Authorization 头 / 拿回端口），自签名 https 可浏览但播放取决于 MX 自带 FFmpeg
           - 构建来源：\`${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\`
           EOF
           cat release_body.md

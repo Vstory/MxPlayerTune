@@ -154,6 +154,77 @@ final class RemoteEntries {
         return raw;
     }
 
+    /**
+     * 读侧归一 + **凭据内联**（hook ① 的生产入口；user/pass 传已解码的真凭据，空 = 不带）。
+     *
+     * <p>为什么播放链路必须把凭据写进 URL（真机 dex 事实，见 hook信息记录.md §三）：
+     * <ol>
+     *   <li>播放：{@code ActivityScreen.T3} 把「URI → 选项」表存进静态字段，播放前
+     *       {@code l.I} 会调 {@code wJ.c(uri)} —— 它对 {@code uri.getUserInfo()} 做
+     *       {@code "Basic "+base64} 并作为 {@code Authorization} 选项交给 FFPlayer。
+     *       <b>URL 里没有 userinfo ⇒ 播放请求不带 Authorization ⇒ 服务端 401 ⇒ 放不了</b></li>
+     *   <li>缩略图：MX 的 {@code SmbUtil.b(entry)} 本来就是「scheme://[域;][用户:密码@]主机+路径」
+     *       这一形状（它自己就把凭据拼进 URL），但用 {@code getHost()/getPath()} 重建 ⇒ 丢端口</li>
+     * </ol>
+     * 两种形状都要求凭据出现在 URL 的 userinfo 里。SMB 条目与非 http(s) 一律原样（SMB 不受影响）。
+     */
+    static String normalizeRootPath(String raw, String user, String pass) {
+        String s = normalizeRootPath(raw);
+        if (s == null || !HookTargets.isHttpUrl(s)) {
+            return s;
+        }
+        return withUserInfo(s, user, pass);
+    }
+
+    /**
+     * 把凭据作为 userinfo 内联进 http(s) URL：{@code http://用户:密码@host:port/路径}。
+     *
+     * <p>刻意用<b>未编码</b>的真凭据：MX 是直接把 userinfo 整段 base64 的（`l60.a`），
+     * 百分号编码会被原样编进 base64 ⇒ 服务端比对失败。这也与 MX 自己
+     * {@code SmbUtil.b} / {@code getSecurityPath} 的写法一致。
+     */
+    static String withUserInfo(String url, String user, String pass) {
+        if (url == null || user == null || user.isEmpty()) {
+            return url;
+        }
+        int scheme = url.indexOf("://");
+        if (scheme < 0) {
+            return url;
+        }
+        int authStart = scheme + 3;
+        int slash = url.indexOf('/', authStart);
+        String authority = slash < 0 ? url.substring(authStart) : url.substring(authStart, slash);
+        if (authority.indexOf('@') >= 0) {
+            return url;   // 用户自己就把凭据写进「服务器」栏了 ⇒ 不叠加
+        }
+        return url.substring(0, authStart) + user + ":" + (pass == null ? "" : pass) + "@"
+                + url.substring(authStart);
+    }
+
+    /**
+     * 日志脱敏：userinfo 换成 {@code ***:***}。
+     *
+     * <p>凭据内联后 {@code entry.path} 里就有密码，而 hook ① 的「归一」行、hook ② 的
+     * {@code path=} / 返回条目列表都是日志热点 ⇒ 打日志前一律过这里（MX 自己也不是没干过：
+     * 它的缩略图 URL 同样带密码）。
+     */
+    static String maskUserInfo(String url) {
+        if (url == null) {
+            return null;
+        }
+        int scheme = url.indexOf("://");
+        if (scheme < 0) {
+            return url;
+        }
+        int authStart = scheme + 3;
+        int slash = url.indexOf('/', authStart);
+        int at = url.indexOf('@', authStart);
+        if (at < 0 || (slash >= 0 && at > slash)) {
+            return url;
+        }
+        return url.substring(0, authStart) + "***:***" + url.substring(at);
+    }
+
     // ===== 列表规划（纯逻辑，可离机验证）=====
 
     /** 规划项：显示名 + 同词干并列名 + MX 类型。 */
