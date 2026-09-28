@@ -6,8 +6,8 @@ run-name: "Build · ${{ github.ref_name }} · ${{ github.sha }}"
 # 触发：
 #   - push main → 自动构建
 #   - 手动 → 同样构建（无参数）
-# 每次构建都产出**两个包**（Debug + Release），共用同一把固定密钥，一起发进**同一个新 Release**：
-#   · 两者差别 = 调试日志是否被裁掉（排障用 Debug 那个；见「Gradle build」与「Verify APKs」两步）
+# 每次构建都产出**两个包**（debug + release），共用同一把固定密钥，一起发进**同一个新 Release**：
+#   · 两者差别 = 调试日志是否被裁掉（排障用 debug 那个；见「Gradle build」与「Verify APKs」两步）
 #   · 每次构建 = 一个新 tag（`<版本>_<时间>_<短号>`）⇒ **不往固定页滚动更新**，每个版本各有独立页面
 # 纯文档改动不重建（无产物价值，白耗额度）。
 on:
@@ -98,7 +98,7 @@ jobs:
           echo "short=${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
           echo "ts=$(TZ=Asia/Shanghai date -d "@$NOW" +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
 
-      # 签名：从仓库 secrets 解码**固定密钥**。Debug 与 Release **共用同一把** —— 这样两个包能互相
+      # 签名：从仓库 secrets 解码**固定密钥**。debug 与 release **共用同一把** —— 这样两个包能互相
       #   覆盖安装、不必卸载；而卸载会在 LSPosed 里丢掉「已启用 + 已勾作用域」的状态，是本项目
       #   反复装包时最费事的一步。
       #   secrets 名：KEY_BASE64 / SIGNING_STORE_PASSWORD / SIGNING_KEY_ALIAS / SIGNING_KEY_PASSWORD
@@ -139,7 +139,7 @@ jobs:
             printf 'keyAlias=%s\n' "$KEY_ALIAS"
             printf 'keyPassword=%s\n' "$KEY_PASSWORD"
           } >> local.properties
-          echo "已按固定密钥配置签名（Debug 与 Release 两个变体共用同一把）"
+          echo "已按固定密钥配置签名（debug 与 release 两个变体共用同一把）"
 
       - name: Gradle build
         run: |
@@ -150,13 +150,13 @@ jobs:
           echo "── release ──"; ls -la app/build/outputs/apk/release
 
       # 产物命名：<应用名>_<版本>_<时间>_<短号>_<变体>.apk
-      #   例：MxPlayerTune_1.0.0_20260928-1851_2a36fcd7_Debug.apk
+      #   例：MxPlayerTune_1.0.0_20260928-1851_2a36fcd7_debug.apk
       #   · 应用名取 Manifest 的 android:label，空白折成一个点 —— 与平台上传时的改名行为一致
       #     （GitHub 会把资产名里的空格改成点；本地名若保留空格，按它拼的下载链接必然 404）。
       #     在这里现读，避免「应用名」存在第二份来源、改一处忘一处。
       #   · 版本取 app/build.gradle.kts 的 versionName —— 两个包同用一个基准版本号
-      #     （Debug 的 versionName 实际带 -debug 后缀，那是给人看的标记，不进文件名）。
-      #   · 变体在末段、首字母大写（Debug / Release）：两个包同批产出、同发一个 Release 页，靠它区分。
+      #     （debug 的 versionName 实际带 -debug 后缀，那是给人看的标记，不进文件名）。
+      #   · 变体在末段、**全小写**（debug / release）：两个包同批产出、同发一个 Release 页，靠它区分。
       - name: Rename APKs and assert naming rule
         env:
           TS: ${{ steps.info.outputs.ts }}
@@ -190,11 +190,7 @@ jobs:
               fi
               exit 1
             fi
-            case "$VARIANT" in
-              debug)   VARIANT_CAP=Debug ;;
-              release) VARIANT_CAP=Release ;;
-            esac
-            NAME="${PREFIX}_${VER}_${TS}_${SHORT}_${VARIANT_CAP}.apk"
+            NAME="${PREFIX}_${VER}_${TS}_${SHORT}_${VARIANT}.apk"
             cp -- "$SRC" "dist/$NAME"
             echo "产物: dist/$NAME ← $SRC"
           done
@@ -203,13 +199,13 @@ jobs:
           #   发布与说明正文都按该规则拼文件名，改名漏改会静默错（下载 404 / 页面列错文件）
           shopt -s nullglob
           apks=(dist/*.apk)
-          [ "${#apks[@]}" -eq 2 ] || { echo "::error::应产出 2 个包（Debug + Release），实际 ${#apks[@]} 个"; exit 1; }
+          [ "${#apks[@]}" -eq 2 ] || { echo "::error::应产出 2 个包（debug + release），实际 ${#apks[@]} 个"; exit 1; }
           for f in "${apks[@]}"; do
             printf '%s' "$(basename "$f")" \
-              | grep -qE '^[A-Za-z0-9._-]+_[A-Za-z0-9._-]+_[0-9]{8}-[0-9]{4}_[0-9a-f]{8}_(Debug|Release)\.apk$' \
+              | grep -qE '^[A-Za-z0-9._-]+_[A-Za-z0-9._-]+_[0-9]{8}-[0-9]{4}_[0-9a-f]{8}_(debug|release)\.apk$' \
               || { echo "::error::产物名与规则不符（或含空格/百分号等 URL 不友好字符）: $(basename "$f")"; exit 1; }
           done
-          echo "✅ 命名自检通过（${#apks[@]} 个：Debug + Release）"
+          echo "✅ 命名自检通过（${#apks[@]} 个：debug + release）"
           ls -la dist
 
       # 断言两个包都真的可用：三件套齐全 + 变体标记正确 + **真的被固定密钥签过**。
@@ -230,8 +226,10 @@ jobs:
 
           for APK in dist/*.apk; do
             NAME="$(basename "$APK")"
-            # 变体取**末段**（Debug / Release），转小写后与产物内的实际标记比对
-            VARIANT="$(sed -nE 's/^.*_(Debug|Release)\.apk$/\1/p' <<< "$NAME" | tr 'A-Z' 'a-z')"
+            # 变体取**末段**（全小写 debug / release）。
+            #   用与「命名自检」**同一条完整模式**解析（而非宽松的 `.*_`）：
+            #   两处都是「命名规则」的表述，宽窄不一就是漂移源；此处也严格，改规则时必然一起改。
+            VARIANT="$(sed -nE 's/^[A-Za-z0-9._-]+_[A-Za-z0-9._-]+_[0-9]{8}-[0-9]{4}_[0-9a-f]{8}_(debug|release)\.apk$/\1/p' <<< "$NAME")"
             [ -n "$VARIANT" ] || { echo "::error::$NAME 不符合命名规则，无法判定变体 —— 拒绝发布"; exit 1; }
             echo "════ 校验 $NAME（变体 = $VARIANT）"
 
@@ -249,11 +247,11 @@ jobs:
             HAS_DEBUGGABLE=0
             if printf '%s' "$BADGING" | grep -q '^application-debuggable'; then HAS_DEBUGGABLE=1; fi
             if [ "$VARIANT" = "debug" ]; then
-              [ "$HAS_DEBUGGABLE" -eq 1 ] || { echo "::error::$NAME 名为 Debug，却没有 debuggable 标志（变体弄反？）"; exit 1; }
+              [ "$HAS_DEBUGGABLE" -eq 1 ] || { echo "::error::$NAME 名为 debug，却没有 debuggable 标志（变体弄反？）"; exit 1; }
               printf '%s' "$BADGING" | grep -qE "versionName='[^']*-debug'" \
                 || { echo "::error::$NAME 的 versionName 缺 -debug 后缀"; exit 1; }
             else
-              [ "$HAS_DEBUGGABLE" -eq 0 ] || { echo "::error::$NAME 名为 Release，却带 debuggable 标志（变体弄反？）"; exit 1; }
+              [ "$HAS_DEBUGGABLE" -eq 0 ] || { echo "::error::$NAME 名为 release，却带 debuggable 标志（变体弄反？）"; exit 1; }
             fi
             echo "  ✅ 变体标记正确（debuggable=$HAS_DEBUGGABLE）"
 
@@ -291,7 +289,7 @@ jobs:
             echo "  ✅ 签名方案 v2 + v3"
           done
 
-          # ④ 两个包必须是**同一把**签名 —— 这才是「Debug 与 Release 可互相覆盖安装」的前提
+          # ④ 两个包必须是**同一把**签名 —— 这才是「debug 与 release 可互相覆盖安装」的前提
           #    （同包名 + 同签名 ⇒ 直接覆盖；否则 Android 会以签名不一致拒绝安装）
           [ "${DIGEST_OF[debug]}" = "${DIGEST_OF[release]}" ] \
             || { echo "::error::两个变体签名不一致（${DIGEST_OF[debug]} vs ${DIGEST_OF[release]}）—— 无法互相覆盖安装"; exit 1; }
@@ -321,8 +319,8 @@ jobs:
 
           | 包 | 调试日志 | 用途 |
           |---|---|---|
-          | \`${PREFIX}_${VER}_${TS}_${SHORT}_Release.apk\` | 已在编译期裁掉 | 日常使用 |
-          | \`${PREFIX}_${VER}_${TS}_${SHORT}_Debug.apk\` | 保留 | **排障**（看 hook 是否命中、参数与返回值） |
+          | \`${PREFIX}_${VER}_${TS}_${SHORT}_release.apk\` | 已在编译期裁掉 | 日常使用 |
+          | \`${PREFIX}_${VER}_${TS}_${SHORT}_debug.apk\` | 保留 | **排障**（看 hook 是否命中、参数与返回值） |
 
           - 签名证书 SHA-256：\`${CERT_SHA256:-（未读取到）}\`
           - 签名方案：\`${SIGN_SCHEMES:-（未读取到）}\`
