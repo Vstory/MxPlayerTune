@@ -44,7 +44,7 @@ MX Player 增强模块（libxposed API 102 / LSPosed）：让 MX Player 的「�
 | **需 Pro 版** | 作用域为 `com.mxtech.videoplayer.pro`（**专业版**）；免费版 `com.mxtech.videoplayer.ad` 未适配 |
 | **别勾「匿名」** | 勾了就按匿名处理（与 MX 自身判据一致）：列目录与播放都不带凭据，需要账号密码的服务器会 401 |
 | **HTTPS 只保证「浏览」** | 播放与缩略图是 MX 自带 FFmpeg 去取流，证书校验在它那边，本模块管不到 ⇒ **自签名证书下播放/缩略图可能仍失败**。想用 https 请用受信证书，否则用 http |
-| **凭据会出现在 URL 里** | 为了让 MX 的播放与缩略图链路带上鉴权，用户名密码会内联进条目的 URL。仅存在于进程内存（MX 自己就把密码明文存在 `smb_list_data.json`，它的缩略图 URL 也是这个形状）；本模块日志一律脱敏成 `***:***` |
+| **凭据会出现在 URL 里（编码形态）** | 为了让 MX 的播放与缩略图链路带上鉴权，用户名密码会内联进条目的 URL —— 且是 **MX 落库的 `Uri.encode` 形态**（`android.net.Uri#getUserInfo()` 会解码，所以 MX 造 Authorization 头时拿到的仍是真凭据）。仅存在于进程内存（MX 自己就把密码明文存在 `smb_list_data.json`，它的缩略图 URL 也是这个形状）；本模块日志一律脱敏成 `***:***` |
 
 ## 安装
 
@@ -62,6 +62,7 @@ MX Player 增强模块（libxposed API 102 / LSPosed）：让 MX Player 的「�
 - 进「本地网络」点开 WebDAV 服务器后：
   - `[webdav] RemoteDataSource#listDir path=… → 子项 n（目录 m）… 返回 k 项` = **列目录成功**
   - `[webdav] 列目录失败 path=…` = 列目录报错，同一条日志带 HTTP 状态或异常原因（`401/403` 查账号密码与匿名勾选，`404` 查地址与结尾斜杠，`SSLHandshakeException` 查证书）
+  - `MalformedURLException: invalid port: …` = 密码里含 `?` / `#` 这类 URL 结构字符，而 URL 里放的是**解码后的真凭据**（编码形态才是对的，见上表）
   - 日志里**一个 hook 调用都没有** → 不是 hook 失效，而是**目录列举没被触发**：停在「本地网络」列表页不算进入目录；目录页**有缓存**时也不会重新列举，**下拉刷新**可强制重新列举
 - 缩略图：`[DBG] >> SmbUtil#buildThumbUrl 改用条目 path=…` = 缩略图 URL 已改走条目自身 URL（debug 版只打前 3 次）
 - 日志完全无 `MxPlayerTune` → 模块未启用或未生效（检查 LSPosed 中的启用状态与作用域）

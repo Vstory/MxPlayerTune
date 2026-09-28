@@ -155,7 +155,7 @@ final class RemoteEntries {
     }
 
     /**
-     * 读侧归一 + **凭据内联**（hook ① 的生产入口；user/pass 传已解码的真凭据，空 = 不带）。
+     * 读侧归一 + **凭据内联**（hook ① 的生产入口；user/pass 传 MX 落库的原值，空 = 不带）。
      *
      * <p>为什么播放链路必须把凭据写进 URL（真机 dex 事实，见 hook信息记录.md §三）：
      * <ol>
@@ -167,6 +167,14 @@ final class RemoteEntries {
      *       这一形状（它自己就把凭据拼进 URL），但用 {@code getHost()/getPath()} 重建 ⇒ 丢端口</li>
      * </ol>
      * 两种形状都要求凭据出现在 URL 的 userinfo 里。SMB 条目与非 http(s) 一律原样（SMB 不受影响）。
+     *
+     * <p><b>userinfo 必须是「落库原值（编码形态）」而不是解码后的真凭据</b>（真机事故，见
+     * hook信息记录.md §三.2）：密码里有 {@code ?} / {@code #} 时，把真凭据直接写进 URL 会让
+     * 解析器在 authority <b>中途</b>截断 —— 真机日志原样是
+     * {@code MalformedURLException: invalid port: $WC6&$}（{@code $WC6&$} 就是密码里
+     * {@code ?} 之前那一段）⇒ 列目录全灭。而 MX 的消费者本来认的就是编码形态：
+     * {@code android.net.Uri#getUserInfo()} <b>会解码</b>（官方文档 "decoded"）
+     * ⇒ 编码形态进 URL、真凭据进 Authorization 头。
      */
     static String normalizeRootPath(String raw, String user, String pass) {
         String s = normalizeRootPath(raw);
@@ -179,9 +187,8 @@ final class RemoteEntries {
     /**
      * 把凭据作为 userinfo 内联进 http(s) URL：{@code http://用户:密码@host:port/路径}。
      *
-     * <p>刻意用<b>未编码</b>的真凭据：MX 是直接把 userinfo 整段 base64 的（`l60.a`），
-     * 百分号编码会被原样编进 base64 ⇒ 服务端比对失败。这也与 MX 自己
-     * {@code SmbUtil.b} / {@code getSecurityPath} 的写法一致。
+     * <p>传 MX 落库的原值（{@code ServerEditDialog} 存库前已用 {@code Uri.encode} 过，见
+     * {@link #userInfoSafe}）—— 与 MX 自己 {@code SmbUtil.b} 拼进缩略图 URL 的是同一种形态。
      */
     static String withUserInfo(String url, String user, String pass) {
         if (url == null || user == null || user.isEmpty()) {
@@ -192,13 +199,71 @@ final class RemoteEntries {
             return url;
         }
         int authStart = scheme + 3;
-        int slash = url.indexOf('/', authStart);
-        String authority = slash < 0 ? url.substring(authStart) : url.substring(authStart, slash);
-        if (authority.indexOf('@') >= 0) {
+        if (url.lastIndexOf('@', authorityEnd(url, authStart) - 1) >= authStart) {
             return url;   // 用户自己就把凭据写进「服务器」栏了 ⇒ 不叠加
         }
-        return url.substring(0, authStart) + user + ":" + (pass == null ? "" : pass) + "@"
+        return url.substring(0, authStart) + userInfoSafe(user) + ":" + userInfoSafe(pass) + "@"
                 + url.substring(authStart);
+    }
+
+    /**
+     * authority 段结束位置（{@code ://} 之后第一个 {@code /}；没有则到串尾）。
+     *
+     * <p>刻意<b>不</b>把 {@code ?} / {@code #} 当结束符：真凭据形态下它们可能就落在 userinfo 里，
+     * 按 {@code ?} 截断会漏掉后面的 {@code @} —— 这正是 {@code java.net.URL} 在真机上翻车的地方
+     * （见 {@link #withUserInfo}）。
+     */
+    static int authorityEnd(String url, int authStart) {
+        int end = url.indexOf('/', authStart);
+        return end < 0 ? url.length() : end;
+    }
+
+    /**
+     * userinfo 取值兜底：把会破坏 URL 结构的字符补成百分号编码。
+     *
+     * <p>正常输入是 MX 落库的 {@code Uri.encode} 结果（无裸 {@code ?} / {@code #} / 空格 / {@code +}），
+     * 本方法只做两件事：<b>保留合法</b> {@code %XX}（绝不二次编码）、<b>补编码</b>裸的结构字符。
+     * 于是「落库值是编码形态」（真机现状）与「落库值是原值」（万一 MX 改）两种输入都能得到
+     * 可解析的 URL，且 {@code Uri#getUserInfo()} 解码后都等于真凭据。
+     *
+     * <p>安全集按 RFC 3986 userinfo 取：unreserved + sub-delims（{@code : @ / ? # + %}
+     * 与空白、控制字符、非 ASCII 一律编码）。
+     */
+    static String userInfoSafe(String v) {
+        if (v == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(v.length());
+        for (int i = 0; i < v.length(); ) {
+            int cp = v.codePointAt(i);
+            int width = Character.charCount(cp);
+            if (cp == '%' && width == 1 && i + 2 < v.length()
+                    && isHex(v.charAt(i + 1)) && isHex(v.charAt(i + 2))) {
+                sb.append('%');   // 已是 %XX ⇒ 原样保留
+            } else if (isUserInfoSafe(cp)) {
+                sb.appendCodePoint(cp);
+            } else {
+                for (byte b : new String(Character.toChars(cp))
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8)) {
+                    sb.append('%')
+                            .append(Character.toUpperCase(Character.forDigit((b >> 4) & 0xF, 16)))
+                            .append(Character.toUpperCase(Character.forDigit(b & 0xF, 16)));
+                }
+            }
+            i += width;
+        }
+        return sb.toString();
+    }
+
+    private static boolean isUserInfoSafe(int cp) {
+        if ((cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z') || (cp >= '0' && cp <= '9')) {
+            return true;
+        }
+        return "-._~!$&'()*,;=".indexOf(cp) >= 0;
+    }
+
+    private static boolean isHex(char c) {
+        return Character.digit(c, 16) >= 0;
     }
 
     /**

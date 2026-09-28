@@ -268,7 +268,7 @@ public class MainHook extends XposedModule {
                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
                     Object raw = chain.proceed();
                     String rawStr = raw instanceof String ? (String) raw : null;
-                    String[] cred = credentialsOf(chain.getThisObject());
+                    String[] cred = storedCredentialsOf(chain.getThisObject());
                     String fixed = RemoteEntries.normalizeRootPath(rawStr, cred[0], cred[1]);
                     if (BuildConfig.DEBUG) {
                         if (fixed != null && !fixed.equals(raw)) {
@@ -295,11 +295,14 @@ public class MainHook extends XposedModule {
     }
 
     /**
-     * 条目凭据（{@code {user, pass}}，真凭据，空串 = 匿名/无）。
+     * 条目凭据（{@code {user, pass}}，真凭据，空串 = 匿名/无）—— **自己发请求用**（Authorization 头）。
      *
      * <p>真机事实：{@code ServerEditDialog} 落库时对 userName/password {@code Uri.encode} 过
      * ⇒ 这里 {@code Uri.decode} 还原（服务端要的是真凭据）；{@code anonymity != 0} 表示匿名勾选，
      * 此时 MX 自己也只送匿名，凭据一律不带。
+     *
+     * <p>注意：<b>URL 内联不用这一份</b>（解码后的真凭据里可能有 {@code ?} / {@code #}，
+     * 进了 URL 会让解析器在 authority 中途截断）—— 那一处用 {@link #storedCredentialsOf}。
      */
     private static String[] credentialsOf(Object entry) {
         if (entry == null || RemoteEntries.readIntField(entry, "anonymity", 1) != 0) {
@@ -308,6 +311,22 @@ public class MainHook extends XposedModule {
         return new String[]{
                 Uri.decode(nullToEmpty(RemoteEntries.readOwnField(entry, "userName"))),
                 Uri.decode(nullToEmpty(RemoteEntries.readOwnField(entry, "password")))};
+    }
+
+    /**
+     * 条目凭据的**落库原值**（{@code {user, pass}}）—— **URL 内联专用**（hook ①）。
+     *
+     * <p>为什么不解码：见 {@link #credentialsOf} 的反面 —— MX 落库的是 {@code Uri.encode} 形态，
+     * 而 MX 的消费者认的就是这一形态（{@code android.net.Uri#getUserInfo()} 会解码，
+     * {@code SmbUtil.b} 也直接拼落库原值）⇒ 编码形态进 URL、真凭据出来。
+     */
+    private static String[] storedCredentialsOf(Object entry) {
+        if (entry == null || RemoteEntries.readIntField(entry, "anonymity", 1) != 0) {
+            return new String[]{"", ""};
+        }
+        return new String[]{
+                nullToEmpty(RemoteEntries.readOwnField(entry, "userName")),
+                nullToEmpty(RemoteEntries.readOwnField(entry, "password"))};
     }
 
     // ===== hook ②：RemoteDataSource 目录列举 =====

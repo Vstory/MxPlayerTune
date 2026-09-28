@@ -529,21 +529,48 @@ final class WebDavClient {
         return s.substring(0, end);
     }
 
-    static String stripUserInfo(String rawUrl) throws IOException {
-        URL u = new URL(rawUrl);
-        if (u.getUserInfo() == null) {
+    /**
+     * 去掉 URL 里的 userinfo（{@code http://u:p@host:29798/dav} → {@code http://host:29798/dav}）。
+     *
+     * <p>刻意用<b>字符串手术</b>、不用 {@code new URL(rawUrl)}：真机上密码含 {@code ?} 时，
+     * {@code new URL} 会把 spec 在 {@code ?} 处截断 ⇒ authority 只剩 {@code user:$WC6&$} ⇒
+     * {@code MalformedURLException: invalid port: $WC6&$}（列目录全灭，见 hook信息记录.md §三.2）。
+     * 本方法对任何形状都不抛，且 authority 一律按「{@code ://} 之后第一个 {@code /}」切
+     * （不把 {@code ?} / {@code #} 当结束符 —— 它们可能就在 userinfo 里）。
+     */
+    static String stripUserInfo(String rawUrl) {
+        if (rawUrl == null) {
+            return null;
+        }
+        int scheme = rawUrl.indexOf("://");
+        if (scheme < 0) {
             return rawUrl;
         }
-        String port = u.getPort() > 0 ? ":" + u.getPort() : "";
-        return u.getProtocol() + "://" + u.getHost() + port + u.getFile();
+        int authStart = scheme + 3;
+        int at = userInfoAt(rawUrl, authStart);
+        if (at < authStart) {
+            return rawUrl;
+        }
+        return rawUrl.substring(0, authStart) + rawUrl.substring(at + 1);
     }
 
     static String userInfoOf(String rawUrl) {
-        try {
-            return new URL(rawUrl).getUserInfo();
-        } catch (Exception e) {
+        if (rawUrl == null) {
             return null;
         }
+        int scheme = rawUrl.indexOf("://");
+        if (scheme < 0) {
+            return null;
+        }
+        int authStart = scheme + 3;
+        int at = userInfoAt(rawUrl, authStart);
+        return at < authStart ? null : rawUrl.substring(authStart, at);
+    }
+
+    /** authority 段里 userinfo 与 host 的分隔 {@code @} 位置（无则 -1）。 */
+    private static int userInfoAt(String url, int authStart) {
+        int end = url.indexOf('/', authStart);
+        return url.lastIndexOf('@', (end < 0 ? url.length() : end) - 1);
     }
 
     static String lower(String s) {
