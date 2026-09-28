@@ -150,7 +150,9 @@ public class MainHook extends XposedModule {
     private void backgroundScan() {
         ClassLoader cl = sCl;
         try {
-            log(DEBUG, TAG, "[DBG] [locate] dex 清单: " + HookTargets.dexInventory(cl));
+            if (BuildConfig.DEBUG) {
+                log(DEBUG, TAG, "[DBG] [locate] dex 清单: " + HookTargets.dexInventory(cl));
+            }
 
             List<String> names = HookTargets.enumClassNames(cl);
             if (names == null) {
@@ -158,7 +160,9 @@ public class MainHook extends XposedModule {
                 log(ERROR, TAG, "[locate] 类名枚举失败 → 无法扫描（明细见上）");
                 return;
             }
-            log(DEBUG, TAG, "[DBG] [locate] 枚举类名 " + names.size() + " 个");
+            if (BuildConfig.DEBUG) {
+                log(DEBUG, TAG, "[DBG] [locate] 枚举类名 " + names.size() + " 个");
+            }
 
             Class<?> ds = HookTargets.scanRemoteDataSource(cl, sRemoteEntryCls, names, "RemoteDataSource");
             Class<?> serverDs = HookTargets.scanServerDataSource(cl, names, "ServerDataSource");
@@ -176,8 +180,10 @@ public class MainHook extends XposedModule {
             Thread.sleep(RESCAN_DELAY_MS);
             List<String> after = HookTargets.enumClassNames(cl);
             List<String> delta = HookTargets.diff(names, after);
-            log(DEBUG, TAG, "[DBG] [locate] 二次枚举（+" + (RESCAN_DELAY_MS / 1000) + "s）: 类名 "
-                    + names.size() + " → " + (after == null ? "?" : after.size()) + "，新增 " + delta.size());
+            if (BuildConfig.DEBUG) {
+                log(DEBUG, TAG, "[DBG] [locate] 二次枚举（+" + (RESCAN_DELAY_MS / 1000) + "s）: 类名 "
+                        + names.size() + " → " + (after == null ? "?" : after.size()) + "，新增 " + delta.size());
+            }
             if (after != null && !delta.isEmpty()) {
                 Class<?> ds2 = HookTargets.scanRemoteDataSource(cl, sRemoteEntryCls, delta, "RemoteDataSource(二次)");
                 Class<?> serverDs2 = HookTargets.scanServerDataSource(cl, delta, "ServerDataSource(二次)");
@@ -193,16 +199,19 @@ public class MainHook extends XposedModule {
             boolean main = isMainProcess();
             log(main ? ERROR : INFO, TAG, "[locate] 全量扫描无命中 → 模块 no-op（MX 原功能不受影响）"
                     + (main ? "；本进程为主进程，需按上方明细（near-miss / triage）判断是判据失手还是类不在" : "；本进程非主进程，多进程下正常"));
-            log(DEBUG, TAG, "[DBG] [locate] 【结论性证据】锚点邻域与 near-miss 见上；"
-                    + "若 triage 里没有锚点包（" + HookTargets.ANCHOR_PKG + "）以外的可疑类且无 near-miss，"
-                    + "说明目标类不在已加载 dex 中");
+            if (BuildConfig.DEBUG) {
+                log(DEBUG, TAG, "[DBG] [locate] 【结论性证据】锚点邻域与 near-miss 见上；"
+                        + "若 triage 里没有锚点包（" + HookTargets.ANCHOR_PKG + "）以外的可疑类且无 near-miss，"
+                        + "说明目标类不在已加载 dex 中");
+            }
         } catch (Throwable t) {
             log(ERROR, TAG, "[ERR] 后台扫描异常: " + t, t);
         }
     }
 
+    /** 打印定位明细（D 级：调用点必须包在 {@code if (BuildConfig.DEBUG)} 里，release 编译期消除）。 */
     private void flushDiag(String phase) {
-        if (HookTargets.DIAG.length() > 0) {
+        if (HookTargets.DIAG.length() > 0 && BuildConfig.DEBUG) {
             log(DEBUG, TAG, "[DBG] [locate] " + phase + "明细:\n" + HookTargets.DIAG);
         }
     }
