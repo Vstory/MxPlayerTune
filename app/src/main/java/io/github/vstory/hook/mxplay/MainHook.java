@@ -20,7 +20,7 @@ import io.github.libxposed.api.XposedModuleInterface;
  *
  * <p>目标：让 MX Player 的「本地网络」在 SMB 之外支持 WebDAV。
  *
- * <p>三个 hook（详见知识库 项目开发记录/io.github.vstory.hook.mxplay/）：
+ * <p>四个 hook（详见知识库 项目开发记录/io.github.vstory.hook.mxplay/）：
  * <ol>
  *   <li>{@code SmbServerEntry#getRootPath()} —— webdav 服务器算出来的 rootPath 带着硬编码的
  *       {@code smb://} 前缀，读侧归一（{@code smb://http://…} → {@code http://…}）
@@ -31,6 +31,9 @@ import io.github.libxposed.api.XposedModuleInterface;
  *       否则原样放行（SMB 功能不受影响）</li>
  *   <li>{@code SmbUtil} 的缩略图 URL 构造方法 —— 对 http(s) 直接返回条目 {@code path}
  *       （MX 自己重建 URL 时用 {@code getHost()+getPath()} ⇒ 丢端口，非 80/443 必然拿不到缩略图）</li>
+ *   <li>{@code java.net.URL#openConnection()} —— 图片/缩略图取流补 {@code Authorization}：
+ *       缩略图走 Glide，而 Glide 的取流<b>不</b>把 URL 里的 userinfo 变成鉴权头
+ *       ⇒ 否则「能列目录、能播放，只有缩略图空白」（见 {@link #hookUrlAuth}）</li>
  * </ol>
  *
  * <p>生命周期：onModuleLoaded → onPackageReady → installHooks
@@ -242,6 +245,9 @@ public class MainHook extends XposedModule {
         }
         hookThumbnailUrl(HookTargets.smbUtilBuildUrl(sSmbUtilCls));
 
+        // hook ④：图片/缩略图取流补 Basic 鉴权（Glide 的取流不认 URL 里的 userinfo）
+        hookUrlAuth();
+
         log(INFO, TAG, "installHooks done: " + sHookOk + " OK / " + sHookFail + " FAIL" + DETAIL);
         if (BuildConfig.DEBUG) {
             log(DEBUG, TAG, "[DBG] [locate] 最终定位: RemoteEntry=" + name(sRemoteEntryCls)
@@ -434,6 +440,96 @@ public class MainHook extends XposedModule {
             if (filter != null) {
                 filter.close();
             }
+        }
+    }
+
+    // ===== hook ④：图片取流补 Basic 鉴权 =====
+
+    /** 本 hook 的 DEBUG 明细只打前几次（列表页滚动会反复取图）。 */
+    private static final int AUTH_LOG_MAX = 8;
+    private static int sAuthLogged;
+
+    /**
+     * 给「URL 里带 userinfo 的 http(s) 取流」补上 {@code Authorization} 头。
+     *
+     * <p>真机事实（见 hook信息记录.md §三.4）：<b>播放与缩略图走的不是同一套鉴权</b>。
+     * 播放交给 MX 自己的 FFPlayer，它会按 {@code uri.getUserInfo()} 生成
+     * {@code Authorization} 选项（{@code wJ.c(uri)}）⇒ 带鉴权；而缩略图/图片走
+     * {@code hr0.a} → {@code ImageLoader}（{@code LVL}）→ <b>Glide</b> 的
+     * {@code HttpUrlFetcher}，它<b>不认</b> URL 里的 userinfo（Glide 的取流只看
+     * {@code GlideUrl} 自带的 header 表）⇒ 服务端 401 ⇒ 缩略图一直空白，且<b>不报错</b>
+     * （只有 401 → 显示占位图，日志里什么都没有）。
+     *
+     * <p>为什么挂在 {@code java.net.URL#openConnection()} 上（不挂混淆名的 Glide 类）：
+     * <ol>
+     *   <li>它是不依赖版本/混淆名的一层，凡走 {@code java.net} 的取流都被覆盖
+     *       （Glide 默认取流、OkHttp 的 URLConnection 桥、MX 自己的取图）</li>
+     *   <li>载荷零风险：<b>只对 userinfo 非空的 http(s) URL 生效</b>，且已有
+     *       {@code Authorization} 时不覆盖 —— 其它网络请求一律原样放行</li>
+     * </ol>
+     *
+     * <p>补的头值与列目录/播放同源（{@link WebDavClient#authOfUserInfo}：userinfo 是编码形态，
+     * 解码后再 Basic）。
+     */
+    private void hookUrlAuth() {
+        final String desc = "java.net.URL#openConnection(图片取流补鉴权)";
+        try {
+            Method noArg = java.net.URL.class.getDeclaredMethod("openConnection");
+            Method withProxy = java.net.URL.class.getDeclaredMethod("openConnection", java.net.Proxy.class);
+            noArg.setAccessible(true);
+            withProxy.setAccessible(true);
+            XposedInterface.Hooker h = new XposedInterface.Hooker() {
+                @Override
+                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    Object result = chain.proceed();
+                    try {
+                        injectUrlAuth(result);
+                    } catch (Throwable t) {
+                        if (BuildConfig.DEBUG) {
+                            log(DEBUG, TAG, "[DBG] hook ④ 补鉴权异常（已忽略）: " + t);
+                        }
+                    }
+                    return result;
+                }
+            };
+            hook(noArg).intercept(h);
+            hook(withProxy).intercept(h);
+            sHookOk++;
+            DETAIL.append("\n[OK] ").append(desc);
+        } catch (Throwable t) {
+            sHookFail++;
+            DETAIL.append("\n[FAIL] ").append(desc).append(": ").append(t);
+            if (BuildConfig.DEBUG) {
+                log(DEBUG, TAG, "[DBG] hook FAIL: " + desc + " -> " + t);
+            }
+        }
+    }
+
+    /** 取流结果若来自「带 userinfo 的 http(s) URL」且还没有 Authorization，就补上。 */
+    private void injectUrlAuth(Object result) {
+        if (!(result instanceof java.net.URLConnection)) {
+            return;
+        }
+        java.net.URLConnection conn = (java.net.URLConnection) result;
+        boolean added = WebDavClient.injectUrlAuth(conn);
+        if (!BuildConfig.DEBUG || sAuthLogged >= AUTH_LOG_MAX) {
+            return;
+        }
+        String raw;
+        try {
+            raw = conn.getURL() == null ? "?" : conn.getURL().toExternalForm();
+        } catch (Throwable t) {
+            raw = "?";
+        }
+        if (added) {
+            sAuthLogged++;
+            log(DEBUG, TAG, "[DBG] >> 取流补上 Authorization（图片/缩略图链路） url="
+                    + RemoteEntries.maskUserInfo(raw) + " conn=" + conn.getClass().getSimpleName());
+        } else if (raw.contains("/dav")) {
+            // 这条是给「缩略图仍空白」准备的关键线索：说明宿主确实来取图了，但 URL 里没有凭据
+            sAuthLogged++;
+            log(DEBUG, TAG, "[DBG] >> 取流未带凭据（URL 无 userinfo）url="
+                    + RemoteEntries.maskUserInfo(raw));
         }
     }
 
