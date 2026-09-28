@@ -57,10 +57,17 @@ final class HookTargets {
     /** 锚点所在包（triage 用：列出该包下 classloader 可见的类）。 */
     static final String ANCHOR_PKG = "com.mxtech.videoplayer.smb";
 
-    /** RemoteDataSource 候选混淆名（1.93.4 = LYi0）。升级后在此追加新候选。 */
-    private static final String[] REMOTE_DS_NAMES = {"LYi0"};
-    /** ServerDataSource 候选混淆名（1.93.4 = LHn0）。升级后在此追加新候选。 */
-    private static final String[] SERVER_DS_NAMES = {"LHn0"};
+    /**
+     * RemoteDataSource 候选混淆名（1.93.4 真机实测 = {@code Yi0}）。升级后在此追加新候选。
+     *
+     * <p>⚠️ **类名不含描述符前缀**：smali 里写 {@code LYi0;}，但类名只是 {@code Yi0}
+     * —— {@code L} 与 {@code ;} 是 dex 类型描述符语法，不是名字的一部分。
+     * 曾把 {@code LYi0} 当类名写入本表 ⇒ {@code Class.forName} 永远抛 ClassNotFoundException
+     * （真机日志那行「候选名存在性 = false」是唯一提示）。{@link #normalizeName} 已做容错。
+     */
+    private static final String[] REMOTE_DS_NAMES = {"Yi0"};
+    /** ServerDataSource 候选混淆名（1.93.4 真机实测 = {@code Hn0}）。升级后在此追加新候选。 */
+    private static final String[] SERVER_DS_NAMES = {"Hn0"};
 
     private static final String[] REMOTE_DS_METHOD_NAMES = {"a"};
     private static final String[] SERVER_DS_METHOD_NAMES = {"a"};
@@ -97,20 +104,72 @@ final class HookTargets {
 
     // ===== 类加载 =====
 
+    /**
+     * 把 smali / dex 类型描述符容错归一成类名：{@code LYi0;} → {@code Yi0}，
+     * {@code Lcom/x/y/Z;} → {@code com.x.y.Z}。
+     *
+     * <p>存量教训：候选混淆名常从 smali 里抄，而 smali 的类型是 {@code L…;} 形态。
+     * 归一是防这类抄写错误再次静默失效的兜底（真名不受影响）。
+     */
+    static String normalizeName(String raw) {
+        String s = raw.trim();
+        if (s.length() > 2 && s.charAt(0) == 'L' && s.endsWith(";")) {
+            return s.substring(1, s.length() - 1).replace('/', '.');
+        }
+        return s;
+    }
+
     /** 按名加载（initialize=false：绝不触发目标类 &lt;clinit&gt;），失败原因记入 DIAG。 */
     static Class<?> load(ClassLoader cl, String name) {
+        String n = normalizeName(name);
         try {
-            return Class.forName(name, false, cl);
+            return Class.forName(n, false, cl);
         } catch (Throwable t) {
-            diag(name + " → 取不到类: " + t.getClass().getSimpleName());
+            diag(n + " → 取不到类: " + t.getClass().getSimpleName());
             return null;
         }
+    }
+
+    /**
+     * {@code SmbServerEntry#getRootPath()} —— 条目 path 的唯一来源，也是 hook ① 的落点。
+     *
+     * <p>选它而不是 {@code buildRootPath()} 的依据（真机 dex 的 xref 实测，见 hook信息记录.md）：
+     * {@code rootPath} 字段<b>只</b>被 {@code getRootPath()} 读、只被 {@code buildRootPath()} 写；
+     * 而 {@code getRootPath()} 只有 3 个调用点，其中就是给 {@code RemoteEntry.path} 赋值的那一个。
+     * ⇒ 在<b>读侧</b>一次归一，既覆盖新建条目、也覆盖 Gson 反序列化后直接读旧值的路径，
+     * 且不必重写 MX 自己的字符串拼装逻辑（反斜杠剥除、斜杠处理都交给它）。
+     */
+    static Method rootPathGetter(Class<?> smbServerCls, String method) {
+        if (smbServerCls == null) {
+            diag("hook ① 跳过: SmbServerEntry 未取到，无法定位 " + method);
+            return null;
+        }
+        try {
+            Method m = smbServerCls.getDeclaredMethod(method);
+            m.setAccessible(true);
+            return m;
+        } catch (Throwable t) {
+            diag("hook ① 定位失败: " + smbServerCls.getName() + "#" + method + " → " + t);
+            return null;
+        }
+    }
+
+    /** hook ① 目标方法名（1.93.4 未混淆）。 */
+    static final String M_SMB_GET_ROOT_PATH = "getRootPath";
+
+    /** http/https 判定（WebDAV 走这两个 scheme）。 */
+    static boolean isHttpUrl(String s) {
+        if (s == null) {
+            return false;
+        }
+        return s.regionMatches(true, 0, "http://", 0, 7)
+                || s.regionMatches(true, 0, "https://", 0, 8);
     }
 
     /** 静默按名加载（锚点类用，失败不记流水）。 */
     static Class<?> loadQuiet(ClassLoader cl, String name) {
         try {
-            return Class.forName(name, false, cl);
+            return Class.forName(normalizeName(name), false, cl);
         } catch (Throwable t) {
             return null;
         }
