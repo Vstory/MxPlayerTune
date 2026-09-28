@@ -1,11 +1,14 @@
 name: Build
 
-# 运行标题：多跑几次时用于辨认批次（渠道 + 分支）。
-run-name: "Build · ${{ github.event.inputs.build_type == 'release' && 'Release' || 'Test' }} · ${{ github.ref_name }}"
+# 运行标题：多跑几次时用于辨认批次（分支 + 短号）。
+run-name: "Build · ${{ github.ref_name }} · ${{ github.sha }}"
 
 # 触发：
-#   - push main → 自动出**测试版**（无需人工，日常改完即得可装包）
-#   - 手动 → 可选 test / release
+#   - push main → 自动构建
+#   - 手动 → 同样构建（无参数）
+# 每次构建都产出**两个包**（Debug + Release），共用同一把固定密钥，一起发进**同一个新 Release**：
+#   · 两者差别 = 调试日志是否被裁掉（排障用 Debug 那个；见「Gradle build」与「Verify APKs」两步）
+#   · 每次构建 = 一个新 tag（`<版本>_<时间>_<短号>`）⇒ **不往固定页滚动更新**，每个版本各有独立页面
 # 纯文档改动不重建（无产物价值，白耗额度）。
 on:
   push:
@@ -15,20 +18,11 @@ on:
       - 'LICENSE'
       - '.gitignore'
   workflow_dispatch:
-    inputs:
-      build_type:
-        description: '构建类型: test=测试版(debug 变体,含调试日志) / release=正式版(随机临时签名,待接入固定密钥)'
-        required: true
-        default: test
-        type: choice
-        options:
-          - test
-          - release
 
-# 并发：同一渠道串行排队，避免两次运行同时往同一个 Release 上传/清理。
+# 并发：串行排队，避免两次运行同时发布（tag 互不相同，这里只是避免互相拖慢与日志交错）。
 # 不用 cancel-in-progress —— 中途取消可能留下半个上传状态。
 concurrency:
-  group: build-${{ github.ref }}-${{ github.event.inputs.build_type || 'test' }}
+  group: build-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -104,15 +98,14 @@ jobs:
           echo "short=${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
           echo "ts=$(TZ=Asia/Shanghai date -d "@$NOW" +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
 
-      # 签名：从仓库 secrets 解码**固定密钥**。测试版与正式版**共用同一把** —— 这样测试包能直接
-      #   覆盖升级、不必卸载；而卸载会在 LSPosed 里丢掉「已启用 + 已勾作用域」的状态，是本项目
-      #   反复装测试包时最费事的一步。
+      # 签名：从仓库 secrets 解码**固定密钥**。Debug 与 Release **共用同一把** —— 这样两个包能互相
+      #   覆盖安装、不必卸载；而卸载会在 LSPosed 里丢掉「已启用 + 已勾作用域」的状态，是本项目
+      #   反复装包时最费事的一步。
       #   secrets 名：KEY_BASE64 / SIGNING_STORE_PASSWORD / SIGNING_KEY_ALIAS / SIGNING_KEY_PASSWORD
       #   ⚠️ secret 一律经 env 传入、run 脚本里**只引用变量名** —— 不把 ${{ secrets.X }} 写进 run 正文：
       #      值里若含 `$` 或反引号会被 shell 二次展开（实测口令含 $ 时被吃成前半截，且在签名报错前毫无提示）。
       #   ⚠️ 缺 secret 时**直接失败**，不回退到调试签名 —— 回退的后果是产物看着"构建成功"、
       #      签名却不对，要等安装升级时才发现。
-      #   ⚠️ 本步骤对两个渠道都执行（debug 变体也挂同一个 signingConfig，见 app/build.gradle.kts）。
       - name: Prepare signing (fixed key from secrets)
         env:
           KEY_BASE64: ${{ secrets.KEY_BASE64 }}
@@ -131,6 +124,13 @@ jobs:
 
           KS="$GITHUB_WORKSPACE/ci-signing.jks"
           printf '%s' "$KEY_BASE64" | base64 -d > "$KS"
+
+          # 就地自检：解出的库能否用该口令打开、别名是否存在。
+          #   否则「口令写错 / KEY_BASE64 其实是另一个库」会拖到 AGP 签名阶段才报错，且信息含糊。
+          keytool -list -keystore "$KS" -storepass:env STORE_PASSWORD -alias "$KEY_ALIAS" >/dev/null 2>&1 \
+            || { echo "::error::密钥库打不开或别名不存在 —— 核对 KEY_BASE64 / SIGNING_STORE_PASSWORD / SIGNING_KEY_ALIAS"; exit 1; }
+          echo "已校验：密钥库可打开、别名存在"
+
           # storeFile 由 runner 现场拼（$GITHUB_WORKSPACE），不写死 runner 上的仓库路径名，
           # 改名/换布局都不会失配。
           {
@@ -139,143 +139,185 @@ jobs:
             printf 'keyAlias=%s\n' "$KEY_ALIAS"
             printf 'keyPassword=%s\n' "$KEY_PASSWORD"
           } >> local.properties
-          echo "已按固定密钥配置签名（测试版与正式版共用同一把）"
+          echo "已按固定密钥配置签名（Debug 与 Release 两个变体共用同一把）"
 
       - name: Gradle build
-        env:
-          BUILD_TYPE: ${{ github.event.inputs.build_type || 'test' }}
         run: |
           chmod +x gradlew
-          if [ "$BUILD_TYPE" = "release" ]; then
-            ./gradlew --no-daemon :app:assembleRelease
-            SRC=app/build/outputs/apk/release
-          else
-            ./gradlew --no-daemon :app:assembleDebug
-            SRC=app/build/outputs/apk/debug
-          fi
-          echo "SRC=$SRC" >> "$GITHUB_ENV"
-          ls -la "$SRC"
+          # 两个变体都构建：release（调试日志已在编译期裁掉）+ debug（保留日志，排障用）
+          ./gradlew --no-daemon :app:assembleRelease :app:assembleDebug
+          echo "── debug ──";   ls -la app/build/outputs/apk/debug
+          echo "── release ──"; ls -la app/build/outputs/apk/release
 
-      # 产物命名：<模块名>_<构建时间(北京时间)>_<渠道>_<短提交号>.apk
-      #   时间戳在前便于肉眼按批次辨认；短号用于对应 commit。
-      - name: Rename APK and assert naming rule
+      # 产物命名：<应用名>_<版本>_<时间>_<短号>_<变体>.apk
+      #   例：MxPlayerTune_1.0.0_20260928-1851_2a36fcd7_Debug.apk
+      #   · 应用名取 Manifest 的 android:label，空白折成一个点 —— 与平台上传时的改名行为一致
+      #     （GitHub 会把资产名里的空格改成点；本地名若保留空格，按它拼的下载链接必然 404）。
+      #     在这里现读，避免「应用名」存在第二份来源、改一处忘一处。
+      #   · 版本取 app/build.gradle.kts 的 versionName —— 两个包同用一个基准版本号
+      #     （Debug 的 versionName 实际带 -debug 后缀，那是给人看的标记，不进文件名）。
+      #   · 变体在末段、首字母大写（Debug / Release）：两个包同批产出、同发一个 Release 页，靠它区分。
+      - name: Rename APKs and assert naming rule
         env:
-          BUILD_TYPE: ${{ github.event.inputs.build_type || 'test' }}
+          TS: ${{ steps.info.outputs.ts }}
+          SHORT: ${{ steps.info.outputs.short }}
         run: |
-          CHANNEL="$BUILD_TYPE"
-          TS="${{ steps.info.outputs.ts }}"
-          SHORT="${{ steps.info.outputs.short }}"
-          mkdir -p dist
-          n=0
-          for f in "$SRC"/*.apk; do
-            [ -e "$f" ] || continue
-            NAME="MxPlayerTune_${TS}_${CHANNEL}_${SHORT}.apk"
-            cp -- "$f" "dist/$NAME"
-            n=$((n + 1))
-            echo "产物: dist/$NAME（源 $(basename "$f")）"
-          done
-          [ "$n" -ge 1 ] || { echo "::error::未找到任何 APK 产物"; exit 1; }
+          LABEL="$(sed -nE 's/.*android:label="([^"]+)".*/\1/p' app/src/main/AndroidManifest.xml | head -1)"
+          [ -n "$LABEL" ] || { echo "::error::读不到应用名（AndroidManifest 的 android:label），拒绝用空前缀给产物命名"; exit 1; }
+          PREFIX="$(printf '%s' "$LABEL" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/./g')"
+          # 折完再守一道：宁可在此失败，也不要产出一个「页面能看、链接打不开」的名字
+          case "$PREFIX" in
+            ""|*[!A-Za-z0-9._-]*|.*|*.)
+              echo "::error::产物名前缀为空或含非法字符：'$PREFIX'（仅允许字母/数字/._-）"; exit 1 ;;
+          esac
 
-          # 命名自检：本文件的发布/清理步骤都按该规则解析文件名，改名漏改会静默错（404 / 永不被清理）
-          for f in dist/*.apk; do
-            printf '%s' "$(basename "$f")" \
-              | grep -qE '^MxPlayerTune_[0-9]{8}-[0-9]{4}_(test|release)_[0-9a-f]{8}\.apk$' \
-              || { echo "::error::产物命名不符合规则: $(basename "$f")"; exit 1; }
+          VER="$(sed -nE 's/^[[:space:]]*versionName = "([^"]+)".*/\1/p' app/build.gradle.kts | head -1)"
+          [ -n "$VER" ] || { echo "::error::读不到 versionName（app/build.gradle.kts），拒绝用空版本号给产物命名"; exit 1; }
+
+          echo "产物名构成: 应用名=${PREFIX} 版本=${VER} 时间=${TS} 短号=${SHORT}"
+          echo "PREFIX=${PREFIX}" >> "$GITHUB_ENV"
+          echo "VER=${VER}"       >> "$GITHUB_ENV"
+
+          mkdir -p dist
+          for VARIANT in debug release; do
+            SRC="app/build/outputs/apk/${VARIANT}/app-${VARIANT}.apk"
+            if [ ! -f "$SRC" ]; then
+              UNSIGNED="app/build/outputs/apk/${VARIANT}/app-${VARIANT}-unsigned.apk"
+              if [ -f "$UNSIGNED" ]; then
+                echo "::error::${VARIANT} 变体产物未签名（出现 app-${VARIANT}-unsigned.apk）—— signingConfig 没生效"
+              else
+                echo "::error::未找到 ${VARIANT} 变体产物：$SRC"
+              fi
+              exit 1
+            fi
+            case "$VARIANT" in
+              debug)   VARIANT_CAP=Debug ;;
+              release) VARIANT_CAP=Release ;;
+            esac
+            NAME="${PREFIX}_${VER}_${TS}_${SHORT}_${VARIANT_CAP}.apk"
+            cp -- "$SRC" "dist/$NAME"
+            echo "产物: dist/$NAME ← $SRC"
           done
-          echo "✅ 命名自检通过（$n 个）"
+
+          # 命名自检（拿**实际产出的文件名**校验，不只信规则自洽）：
+          #   发布与说明正文都按该规则拼文件名，改名漏改会静默错（下载 404 / 页面列错文件）
+          shopt -s nullglob
+          apks=(dist/*.apk)
+          [ "${#apks[@]}" -eq 2 ] || { echo "::error::应产出 2 个包（Debug + Release），实际 ${#apks[@]} 个"; exit 1; }
+          for f in "${apks[@]}"; do
+            printf '%s' "$(basename "$f")" \
+              | grep -qE '^[A-Za-z0-9._-]+_[A-Za-z0-9._-]+_[0-9]{8}-[0-9]{4}_[0-9a-f]{8}_(Debug|Release)\.apk$' \
+              || { echo "::error::产物名与规则不符（或含空格/百分号等 URL 不友好字符）: $(basename "$f")"; exit 1; }
+          done
+          echo "✅ 命名自检通过（${#apks[@]} 个：Debug + Release）"
           ls -la dist
 
-      # 断言产物真的可用：三件套齐全 + **真的被签名**。
+      # 断言两个包都真的可用：三件套齐全 + 变体标记正确 + **真的被固定密钥签过**。
       #   ⚠️ 为什么必须断言签名：AGP 在 signingConfig 缺失时**不报错**，而是产出 app-release-unsigned.apk；
-      #   不拦就会把一个装不上的包发出去。
-      - name: Verify APK (xposed files + signature)
-        env:
-          BUILD_TYPE: ${{ github.event.inputs.build_type || 'test' }}
+      #   不拦就会把一个装不上的包发出去 —— 这类错误只在用户安装时暴露。
+      - name: Verify APKs (xposed files + variant + signature)
         run: |
-          APK="$(ls dist/*.apk | head -1)"
-          echo "校验 $APK"
-
-          MISSING=""
-          for e in META-INF/xposed/java_init.list META-INF/xposed/module.prop META-INF/xposed/scope.list; do
-            unzip -l "$APK" | grep -q "$e" || MISSING="$MISSING $e"
-          done
-          [ -z "$MISSING" ] || { echo "::error::APK 缺 libxposed 三件套:$MISSING（LSPosed 不会识别为模块）"; exit 1; }
-          echo "✅ META-INF/xposed 三件套齐全"
-
           APKSIGNER="$(command -v apksigner || true)"
           [ -n "$APKSIGNER" ] || APKSIGNER="$(ls -d "$ANDROID_SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)"
           [ -n "$APKSIGNER" ] || { echo "::error::找不到 apksigner，无法断言签名 —— 拒绝发布"; exit 1; }
+          AAPT2="$(ls -d "$ANDROID_SDK_ROOT"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)"
+          [ -n "$AAPT2" ] || { echo "::error::找不到 aapt2（用于读变体标记）"; exit 1; }
 
-          OUT="$("$APKSIGNER" verify --print-certs "$APK" 2>&1 || true)"
-          if printf '%s' "$OUT" | grep -qi 'DOES NOT VERIFY\|Missing.*signature\|no signature'; then
-            echo "::error::产物未通过签名校验 —— 拒绝发布（release 变体是否漏配 signingConfig？）"
-            printf '%s\n' "$OUT"
-            exit 1
-          fi
-          # 指纹行格式随 build-tools 版本变化，两种都认：
-          #   旧：Signer #1 certificate SHA-256 digest: <hex>
-          #   37：V2 Signer: certificate SHA-256 digest: <hex>
-          # （只取第一条 SHA-256；下面还要求非空，故格式再变也只会失败在这里而不是静默放行）
-          DIGEST="$(printf '%s' "$OUT" | sed -nE 's/^.*certificate SHA-256 digest: ([0-9a-fA-F]+).*$/\1/p' | head -1)"
-          [ -n "$DIGEST" ] || { echo "::error::读不到签名证书指纹（apksigner 未能解析产物）"; printf '%s\n' "$OUT"; exit 1; }
-
-          # 断言确实是**固定密钥**签的 —— 拦「secrets 缺失/写错而落到调试签名」这类静默错误：
-          #   它不会让构建失败，只会让产物装不上，等于错误在用户侧才暴露。
-          #   ⚠️ 换签名密钥时须同步改本行（新指纹取法：keytool -list -v 的 SHA256）。
+          # 固定密钥的证书指纹（SHA-256，大写无冒号）。**换密钥时必须同步改本行**
+          # （取法：keytool -list -v 里的 SHA256，去冒号转大写）。
           EXPECTED_CERT_SHA256="52BCAA9D01539FFDB0C97D30F6C41A418CED5C42E4F77E5D284FC96E3ED13464"
-          ACTUAL="$(printf '%s' "$DIGEST" | tr -d ':' | tr 'a-f' 'A-F')"
-          if [ "$ACTUAL" != "$EXPECTED_CERT_SHA256" ]; then
-            echo "::error::签名指纹与固定密钥不符 —— 拒绝发布"
-            echo "  期望: $EXPECTED_CERT_SHA256"
-            echo "  实际: $ACTUAL"
-            echo "  排查：① 仓库 secrets 是否被清空/写错 ② 若确已轮换密钥，本处期望值需同步更新"
-            exit 1
-          fi
-          echo "✅ 签名有效，且指纹与固定密钥一致：$ACTUAL"
-          echo "CERT_SHA256=$ACTUAL" >> "$GITHUB_ENV"
+          declare -A DIGEST_OF=()
 
-      # 发布目标：测试版 → 滚动预发布 tag `snapshot`（下载入口固定）；正式版 → tag v<versionName>。
+          for APK in dist/*.apk; do
+            NAME="$(basename "$APK")"
+            # 变体取**末段**（Debug / Release），转小写后与产物内的实际标记比对
+            VARIANT="$(sed -nE 's/^.*_(Debug|Release)\.apk$/\1/p' <<< "$NAME" | tr 'A-Z' 'a-z')"
+            [ -n "$VARIANT" ] || { echo "::error::$NAME 不符合命名规则，无法判定变体 —— 拒绝发布"; exit 1; }
+            echo "════ 校验 $NAME（变体 = $VARIANT）"
+
+            # ① libxposed 三件套
+            MISSING=""
+            for e in META-INF/xposed/java_init.list META-INF/xposed/module.prop META-INF/xposed/scope.list; do
+              unzip -l "$APK" | grep -q "$e" || MISSING="$MISSING $e"
+            done
+            [ -z "$MISSING" ] || { echo "::error::$NAME 缺 libxposed 三件套:$MISSING（LSPosed 不会识别为模块）"; exit 1; }
+            echo "  ✅ META-INF/xposed 三件套齐全"
+
+            # ② 变体标记必须与文件名一致 —— 防「两个变体弄反 / 只构建了一个」。
+            #    那种错产出的包外观完全正常，只有装上才发现；而 debug 的日志正是排障唯一手段。
+            BADGING="$("$AAPT2" dump badging "$APK" 2>/dev/null || true)"
+            HAS_DEBUGGABLE=0
+            if printf '%s' "$BADGING" | grep -q '^application-debuggable'; then HAS_DEBUGGABLE=1; fi
+            if [ "$VARIANT" = "debug" ]; then
+              [ "$HAS_DEBUGGABLE" -eq 1 ] || { echo "::error::$NAME 名为 Debug，却没有 debuggable 标志（变体弄反？）"; exit 1; }
+              printf '%s' "$BADGING" | grep -qE "versionName='[^']*-debug'" \
+                || { echo "::error::$NAME 的 versionName 缺 -debug 后缀"; exit 1; }
+            else
+              [ "$HAS_DEBUGGABLE" -eq 0 ] || { echo "::error::$NAME 名为 Release，却带 debuggable 标志（变体弄反？）"; exit 1; }
+            fi
+            echo "  ✅ 变体标记正确（debuggable=$HAS_DEBUGGABLE）"
+
+            # ③ 签名有效 + 指纹等于固定密钥
+            OUT="$("$APKSIGNER" verify --print-certs "$APK" 2>&1 || true)"
+            if printf '%s' "$OUT" | grep -qi 'DOES NOT VERIFY\|Missing.*signature\|no signature'; then
+              echo "::error::$NAME 未通过签名校验 —— 拒绝发布"
+              printf '%s\n' "$OUT"
+              exit 1
+            fi
+            # 指纹行格式随 build-tools 版本变化，两种都认：
+            #   旧：Signer #1 certificate SHA-256 digest: <hex>
+            #   37：V2 Signer: certificate SHA-256 digest: <hex>
+            # （只取第一条 SHA-256；下面还要求非空，故格式再变也只会失败在这里而不是静默放行）
+            DIGEST="$(printf '%s' "$OUT" | sed -nE 's/^.*certificate SHA-256 digest: ([0-9a-fA-F]+).*$/\1/p' | head -1)"
+            [ -n "$DIGEST" ] || { echo "::error::$NAME 读不到签名证书指纹（apksigner 未能解析产物）"; printf '%s\n' "$OUT"; exit 1; }
+            ACTUAL="$(printf '%s' "$DIGEST" | tr -d ':' | tr 'a-f' 'A-F')"
+            if [ "$ACTUAL" != "$EXPECTED_CERT_SHA256" ]; then
+              echo "::error::$NAME 签名指纹与固定密钥不符 —— 拒绝发布"
+              echo "  期望: $EXPECTED_CERT_SHA256"
+              echo "  实际: $ACTUAL"
+              echo "  排查：① 仓库 secrets 是否被清空/写错 ② 若确已轮换密钥，本处期望值需同步更新"
+              exit 1
+            fi
+            DIGEST_OF["$VARIANT"]="$ACTUAL"
+            echo "  ✅ 签名有效，指纹与固定密钥一致：$ACTUAL"
+          done
+
+          # ④ 两个包必须是**同一把**签名 —— 这才是「Debug 与 Release 可互相覆盖安装」的前提
+          #    （同包名 + 同签名 ⇒ 直接覆盖；否则 Android 会以签名不一致拒绝安装）
+          [ "${DIGEST_OF[debug]}" = "${DIGEST_OF[release]}" ] \
+            || { echo "::error::两个变体签名不一致（${DIGEST_OF[debug]} vs ${DIGEST_OF[release]}）—— 无法互相覆盖安装"; exit 1; }
+          echo "✅ 两个变体签名一致：${DIGEST_OF[release]}"
+          echo "CERT_SHA256=${DIGEST_OF[release]}" >> "$GITHUB_ENV"
+
+      # 发布目标：**每次构建一个新 tag**（`<版本>_<时间>_<短号>`），不往固定页滚动更新。
+      #   于是每个版本各有独立页面，历史可逐页回看；页面之间靠 tag 区分。
       - name: Resolve release target
         id: target
-        env:
-          BUILD_TYPE: ${{ github.event.inputs.build_type || 'test' }}
         run: |
-          if [ "$BUILD_TYPE" = "release" ]; then
-            VER="$(sed -nE 's/^[[:space:]]*versionName = "([^"]+)".*/\1/p' app/build.gradle.kts | head -1)"
-            [ -n "$VER" ] || { echo "::error::读不到 versionName，拒绝用空版本号打 tag"; exit 1; }
-            echo "tag=v${VER}"        >> "$GITHUB_OUTPUT"
-            echo "name=MxPlayerTune v${VER}" >> "$GITHUB_OUTPUT"
-            echo "prerelease=false"   >> "$GITHUB_OUTPUT"
-            echo "make_latest=true"   >> "$GITHUB_OUTPUT"
-            echo "channel=release"    >> "$GITHUB_OUTPUT"
-            echo "→ 正式版 tag=v${VER}"
-          else
-            echo "tag=snapshot"          >> "$GITHUB_OUTPUT"
-            echo "name=Snapshot Build"   >> "$GITHUB_OUTPUT"
-            echo "prerelease=true"       >> "$GITHUB_OUTPUT"
-            echo "make_latest=false"     >> "$GITHUB_OUTPUT"
-            echo "channel=test"          >> "$GITHUB_OUTPUT"
-            echo "→ 测试版 tag=snapshot（滚动预发布）"
-          fi
+          TAG="${VER}_${{ steps.info.outputs.ts }}_${{ steps.info.outputs.short }}"
+          echo "tag=${TAG}"                                   >> "$GITHUB_OUTPUT"
+          echo "name=MxPlayerTune ${VER} (${{ steps.info.outputs.ts }})" >> "$GITHUB_OUTPUT"
+          echo "→ tag=${TAG}"
 
       - name: Generate release body
         env:
-          BUILD_TYPE: ${{ github.event.inputs.build_type || 'test' }}
+          TS: ${{ steps.info.outputs.ts }}
+          SHORT: ${{ steps.info.outputs.short }}
         run: |
-          CHANNEL="${{ steps.target.outputs.channel }}"
-          if [ "$CHANNEL" = "release" ]; then
-            SIGN_NOTE="🔒 固定密钥签名，与测试版**同一把** ⇒ 可直接覆盖升级（无需卸载）。"
-          else
-            SIGN_NOTE="🔒 测试版（debug 变体，保留调试日志），与正式版**同一把固定密钥** ⇒ 可直接覆盖升级（无需卸载；卸载会丢掉 LSPosed 里的启用状态）。"
-          fi
           cat > release_body.md <<EOF
-          **MxPlayerTune** · 渠道 \`${CHANNEL}\` · 提交 \`${{ steps.info.outputs.short }}\` · 构建时间（北京时间）\`${{ steps.info.outputs.ts }}\`
+          **MxPlayerTune** ${VER} · 提交 \`${SHORT}\` · 构建时间（北京时间）\`${TS}\`
 
-          ${SIGN_NOTE}
+          本次构建产出**两个包**，两者**同一把固定密钥**签名 ⇒ 装哪个都能被下一次直接覆盖升级，**不必先卸载**（卸载会丢掉 LSPosed 里的启用状态）：
+
+          | 包 | 调试日志 | 用途 |
+          |---|---|---|
+          | \`${PREFIX}_${VER}_${TS}_${SHORT}_Release.apk\` | 已在编译期裁掉 | 日常使用 |
+          | \`${PREFIX}_${VER}_${TS}_${SHORT}_Debug.apk\` | 保留 | **排障**（看 hook 是否命中、参数与返回值） |
 
           - 签名证书 SHA-256：\`${CERT_SHA256:-（未读取到）}\`
+          - 两个包**同包名**，不能同时安装（后装的覆盖先装的）
           - 目标应用：MX Player Pro \`com.mxtech.videoplayer.pro\`（作用域已静态声明，无需手动勾选）
-          - 当前功能状态：**阶段 A（探针）** —— 仅验证模块注入与目标定位，尚未实现 WebDAV 浏览；安装后在 LSPosed 启用本模块并重启 MX Player，日志 tag \`MxPlayerTune\`
+          - 当前功能状态：**阶段 A（探针）** —— 仅验证模块注入与目标定位，尚未实现 WebDAV 浏览
           - 构建来源：\`${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\`
           EOF
           cat release_body.md
@@ -283,7 +325,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: MxPlayerTune-${{ steps.target.outputs.channel }}-${{ steps.info.outputs.short }}
+          name: MxPlayerTune-${{ steps.info.outputs.ts }}-${{ steps.info.outputs.short }}
           path: dist/*.apk
           if-no-files-found: error
 
@@ -292,63 +334,5 @@ jobs:
         with:
           tag_name: ${{ steps.target.outputs.tag }}
           name: ${{ steps.target.outputs.name }}
-          prerelease: ${{ steps.target.outputs.prerelease }}
-          make_latest: ${{ steps.target.outputs.make_latest }}
           body_path: release_body.md
           files: dist/*.apk
-
-      # 清理：保留最新 3 组构建，其余删除。
-      #   用「按构建时间保留最新 N 组」这个**幂等不变式**，不用「总数 − N」计数法 ——
-      #   计数法基于某一时刻快照，并发运行会叠加多删；且重复删除返回 404 会让步骤误报失败。
-      #   性质：任何交错都收敛到同一稳态，且最新构建必在保留集内（永不删到更新的产物）。
-      - name: Cleanup old assets (keep latest 3)
-        if: success()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TARGET_TAG: ${{ steps.target.outputs.tag }}
-        run: |
-          sleep 15   # 等本次上传的 asset 在 API 中可见
-
-          mapfile -t ASSETS < <(gh api --paginate \
-            -H "Accept: application/vnd.github+json" \
-            "repos/${{ github.repository }}/releases/tags/${TARGET_TAG}" \
-            --jq '.assets[] | select(.name | test("^MxPlayerTune_[0-9]{8}-[0-9]{4}_(test|release)_[0-9a-f]{8}\\.apk$")) | [.id, .name] | @tsv')
-          echo "匹配命名规则的 asset 共 ${#ASSETS[@]} 个"
-
-          key_of() {
-            sed -nE 's/^MxPlayerTune_([0-9]{8}-[0-9]{4})_(test|release)_([0-9a-f]{8})\.apk$/\1 \3/p' <<< "$1"
-          }
-
-          KEYS_FILE="$(mktemp)"
-          while IFS=$'\t' read -r _id name; do
-            [ -n "$name" ] || continue
-            key_of "$name"
-          done < <(printf '%s\n' "${ASSETS[@]}") | sort -u -r > "$KEYS_FILE"
-
-          declare -A KEEP=()
-          kept=0
-          while read -r k; do
-            [ -n "$k" ] || continue
-            [ "$kept" -ge 3 ] && break
-            KEEP["$k"]=1
-            kept=$((kept + 1))
-          done < "$KEYS_FILE"
-          echo "保留最新 $kept 组：$(tr '\n' ' ' < "$KEYS_FILE" | cut -c1-200)"
-
-          deleted=0
-          failed=0
-          while IFS=$'\t' read -r id name; do
-            [ -n "$id" ] || continue
-            k="$(key_of "$name")"
-            if [ -n "$k" ] && [ -n "${KEEP[$k]:-}" ]; then continue; fi
-            if gh api -X DELETE -H "Accept: application/vnd.github+json" \
-                 "repos/${{ github.repository }}/releases/assets/$id" >/dev/null 2>&1; then
-              deleted=$((deleted + 1))
-            else
-              failed=$((failed + 1))
-            fi
-          done < <(printf '%s\n' "${ASSETS[@]}")
-          rm -f "$KEYS_FILE"
-
-          echo "已删除 $deleted 个旧 asset"
-          [ "$failed" -eq 0 ] || echo "::notice::$failed 个删除失败（并发下被另一次运行抢先删除会返回 404，属正常）"

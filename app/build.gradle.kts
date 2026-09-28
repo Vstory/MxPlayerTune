@@ -5,8 +5,9 @@ plugins {
 }
 
 // 签名来源：local.properties（已被 .gitignore 忽略）。
-//   CI 每次现场生成一次性随机 keystore 并写入；将来接入固定签名时改由 secrets 提供同样的四个键，
-//   本文件无需再改。未提供时 release 变体不挂签名 —— CI 会断言产物已签名，防止静默产出 unsigned 包。
+//   CI 从仓库 secrets 解出固定 keystore 后写入这四个键；本机构建不带该文件时
+//   不挂签名（debug 回落 AGP 调试签名、release 产出 unsigned）—— CI 会断言产物已签名，
+//   防止静默把 unsigned 包发出去。
 val localProps = Properties().apply {
     val f = rootProject.file("local.properties")
     if (f.exists()) f.inputStream().use { load(it) }
@@ -38,13 +39,15 @@ android {
         }
     }
     buildTypes {
-        // 两个变体都挂同一把固定密钥：测试包才能直接覆盖升级。
-        // 若测试版用 AGP 的调试签名，每次 CI 运行的调试密钥都不同 ⇒ 每次安装都得先卸载，
-        // 而卸载会在 LSPosed 里丢掉「已启用 + 已勾作用域」，是本项目反复测试时最费事的一步。
         debug {
+            // 与正式版**共用同一把签名** ⇒ 两个变体可互相覆盖安装（同包名 + 同签名，直接覆盖即可，
+            // 不必先卸载；而卸载会丢掉 LSPosed 里的「已启用 + 已勾作用域」状态，是本项目反复装包时最费事的一步）。
+            // 未提供固定密钥时（本机不带 local.properties 的开发构建）不挂，回落 AGP 调试签名。
             if (hasSigning) {
                 signingConfig = signingConfigs.getByName("release")
             }
+            // 便于在设备上分辨装的是哪一个（应用信息 / LSPosed 模块列表都看得到）
+            versionNameSuffix = "-debug"
         }
         release {
             isMinifyEnabled = false
