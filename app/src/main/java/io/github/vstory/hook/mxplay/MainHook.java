@@ -1,8 +1,10 @@
 package io.github.vstory.hook.mxplay;
 
 import static android.util.Log.DEBUG;
+import static android.util.Log.ERROR;
 import static android.util.Log.INFO;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 
 import io.github.libxposed.api.XposedInterface;
@@ -10,24 +12,25 @@ import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 
 /**
- * api102 模块入口（java_init.list 声明）。
+ * MxPlayerTune 入口（java_init.list 声明）。
  *
- * <p>生命周期：onModuleLoaded → onPackageReady → installHooks
- * <p>热重载：onHotReloading 返回 true → 旧 hook handle 自动 unhook → installHooks 重装
+ * <p>目标：让 MX Player 的「本地网络」在 SMB 之外支持 WebDAV。
  *
- * <p>📌 新项目修改点：
+ * <p>工作原理（详见知识库 项目开发记录/io.github.vstory.hook.mxplay/）：
  * <ol>
- *   <li>包名 / 模块名（由 new_module_java.sh 替换，或手动改 namespace/applicationId/label）</li>
- *   <li>{@link #installHooks}：填要 hook 的类与方法（复制 {@code addXxxHook} 范例）</li>
- *   <li>scope.list：填被 hook 应用的包名</li>
+ *   <li>hook {@code SmbServerEntry#buildRootPath()} —— http(s) 地址不加 {@code smb://} 前缀，
+ *       使 {@code RemoteEntry.path} 直接是 WebDAV URL（下游播放链路协议无关）</li>
+ *   <li>hook RemoteDataSource 的目录列举方法 —— path 为 http(s) 时走 PROPFIND 列目录，
+ *       否则原样放行（SMB 功能不受影响）</li>
  * </ol>
  *
- * <p>📌 日志分层（模板默认规范，禁止在填码时删掉 DEBUG 记录）：
+ * <p>生命周期：onModuleLoaded → onPackageReady → installHooks
+ *
+ * <p>日志分层（构建规范，填码时不得删 DEBUG）：
  * <ul>
- *   <li><b>INFO</b>（debug + release 都输出）：模块加载 / onPackageReady / hook 安装汇总 OK/FAIL —— 正式版只需这些</li>
- *   <li><b>DEBUG</b>（仅 debug 构建输出）：类/方法匹配细节 + <b>每次拦截调用的参数、是否拦截、返回值</b>。
- *       写法必须是调用点直接 <code>if (BuildConfig.DEBUG) { log(DEBUG, TAG, ...); }</code>，
- *       release 编译时 BuildConfig.DEBUG=false 是编译期常量 → 该分支字节码与字符串常量整体不进入 dex（真正裁剪，非运行时跳过）。</li>
+ *   <li>INFO：模块加载 / onPackageReady / hook 安装汇总 OK-FAIL —— release 也输出</li>
+ *   <li>DEBUG：定位细节 + 每次拦截的参数 / 是否拦截 / 返回值 —— 仅 debug 构建
+ *       （{@code BuildConfig.DEBUG} 是编译期常量，release 整段裁剪）</li>
  * </ul>
  */
 public class MainHook extends XposedModule {
@@ -36,7 +39,11 @@ public class MainHook extends XposedModule {
 
     private static int sHookOk;
     private static int sHookFail;
-    private static StringBuilder sHookDetail;
+    private static final StringBuilder DETAIL = new StringBuilder();
+
+    /** 定位到的目标类（供 hooker 回调复用）。 */
+    private static Class<?> sRemoteEntryCls;
+    private static Class<?> sRemoteDsCls;
 
     public MainHook() {
         super();
@@ -53,112 +60,127 @@ public class MainHook extends XposedModule {
     public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
         ClassLoader cl = param.getClassLoader();
         log(INFO, TAG, "[pkg] onPackageReady, classLoader=" + (cl != null ? "non-null" : "NULL!"));
-        installHooks(cl);
+        try {
+            installHooks(cl);
+        } catch (Throwable t) {
+            log(ERROR, TAG, "[ERR] installHooks threw: " + t, t);
+        }
     }
 
     @Override
     public boolean onHotReloading(XposedModuleInterface.HotReloadingParam param) {
-        // 允许热重载；旧 hook handle 由框架自动 unhook
+        // 允许热重载；旧 hook handle 由框架自动 unhook（本模块无跨重载 static 状态需恢复）
         return true;
     }
 
-    // ===== 入口：在此填要 hook 的类与方法 =====
+    // ===== hook 安装 =====
 
     private void installHooks(ClassLoader cl) {
         sHookOk = 0;
         sHookFail = 0;
-        sHookDetail = new StringBuilder();
+        DETAIL.setLength(0);
 
-        if (BuildConfig.DEBUG) {
-            log(DEBUG, TAG, "[DBG] installHooks start, classLoader=" + cl);
+        // ---- 定位目标（失败即 no-op，不影响 MX 原功能）----
+        sRemoteEntryCls = HookTargets.load(cl, HookTargets.CLS_REMOTE_ENTRY);
+        Class<?> smbServerCls = HookTargets.load(cl, HookTargets.CLS_SMB_SERVER_ENTRY);
+        sRemoteDsCls = HookTargets.remoteDataSource(cl, sRemoteEntryCls);
+        Class<?> serverDsCls = HookTargets.serverDataSource(cl);
+
+        log(INFO, TAG, "[locate] RemoteEntry=" + name(sRemoteEntryCls)
+                + " SmbServerEntry=" + name(smbServerCls)
+                + " RemoteDataSource=" + name(sRemoteDsCls)
+                + " ServerDataSource=" + name(serverDsCls));
+
+        if (sRemoteDsCls == null) {
+            log(ERROR, TAG, "[locate] RemoteDataSource 定位失败 —— 本版本未适配，模块 no-op"
+                    + "（MX 原功能不受影响；需按 HookTargets 的候选名清单补充新混淆名）");
+            return;
         }
 
-        // 示例：addXxxHook(cl, "com.example.target.TargetClass", "targetMethod");（范例见类底部）
-        // addXxxHook(cl, "com.example.target.TargetClass", "targetMethod");
+        // ---- hook ①：目录列举（阶段 A：仅探针日志；阶段 B 接入 PROPFIND）----
+        Method listMethod = HookTargets.directoryListMethod(sRemoteDsCls, new String[]{"a"});
+        hookDirectoryList(listMethod);
 
-        log(INFO, TAG, "installHooks done: " + sHookOk + " OK / " + sHookFail + " FAIL" + sHookDetail);
+        log(INFO, TAG, "installHooks done: " + sHookOk + " OK / " + sHookFail + " FAIL" + DETAIL);
     }
 
-    // ===== 范例 hook（新增 hook 时整段复制改类名/方法名/逻辑即可）=====
-
-    /** 范例：hook 无参/有参方法，拦截打 DEBUG 日志、改参、返回自定义值。 */
-    private void addXxxHook(ClassLoader cl, String clsName, String methodName) {
-        String desc = clsName + "#" + methodName;
+    private void hookDirectoryList(Method target) {
+        final String desc = "RemoteDataSource#listDir";
+        if (target == null) {
+            sHookFail++;
+            DETAIL.append("\n[FAIL] ").append(desc).append(": method not found");
+            return;
+        }
         try {
-            Class<?> cls = cl.loadClass(clsName);
-            Method target = null;
-            for (Method m : cls.getDeclaredMethods()) {
-                if (!m.getName().equals(methodName)) {
-                    continue;
-                }
-                // 📌 同名单参适配：需要时在此按参数个数/类型精确匹配（见本类下方 hookMethodBySig 注释）
-                target = m;
-                if (BuildConfig.DEBUG) {
-                    log(DEBUG, TAG, "[DBG] hook target matched: " + m);
-                }
-                break;
-            }
-            if (target == null) {
-                throw new NoSuchMethodException(desc);
-            }
             target.setAccessible(true);
             hook(target).intercept(new XposedInterface.Hooker() {
                 @Override
                 public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                    // ① 进方法：打 DEBUG（参数是啥）—— release 编译期整段裁剪
+                    Object entry = chain.getArg(0);
+                    String path = readStringField(entry, "path");
                     if (BuildConfig.DEBUG) {
-                        log(DEBUG, TAG, "[DBG] >> " + desc + " args=" + chain.getArgs());
+                        log(DEBUG, TAG, "[DBG] >> " + desc + " entry=" + entry);
+                        log(DEBUG, TAG, "[DBG] >> " + desc + " name=" + readStringField(entry, "name")
+                                + " type=" + readIntField(entry, "type")
+                                + " path=" + path);
+                        log(DEBUG, TAG, "[DBG] >> " + desc + " isWebDav=" + isHttpUrl(path));
                     }
-                    // ② 三种常用改法（按需保留一种）：
-                    //   a) 拦截不执行原方法，返回自定义值：
-                    //      if (BuildConfig.DEBUG) { log(DEBUG, TAG, "[DBG] << " + desc + " BLOCKED, return custom"); }
-                    //      return Boolean.TRUE;
-                    //   b) 改第 0 参再继续：
-                    //      Object a0 = chain.getArg(0);
-                    //      if (a0 instanceof String) { return chain.proceed(new Object[]{"改后值"}); }
-                    //   c) 默认：原方法继续
                     Object result = chain.proceed();
-                    // ③ 出方法：打 DEBUG（返回了啥）—— release 编译期整段裁剪
                     if (BuildConfig.DEBUG) {
-                        log(DEBUG, TAG, "[DBG] << " + desc + " ret=" + result);
+                        int n = (result instanceof java.util.List) ? ((java.util.List<?>) result).size() : -1;
+                        log(DEBUG, TAG, "[DBG] << " + desc + " ret.size=" + n);
                     }
                     return result;
                 }
             });
             sHookOk++;
-            sHookDetail.append("\n[OK] ").append(desc);
-            if (BuildConfig.DEBUG) {
-                log(DEBUG, TAG, "[DBG] hook installed OK: " + desc);
-            }
-        } catch (Throwable e) {
+            DETAIL.append("\n[OK] ").append(desc);
+        } catch (Throwable t) {
             sHookFail++;
-            sHookDetail.append("\n[FAIL] ").append(desc).append(": ").append(e.getMessage());
+            DETAIL.append("\n[FAIL] ").append(desc).append(": ").append(t);
             if (BuildConfig.DEBUG) {
-                log(DEBUG, TAG, "[DBG] hook install FAIL: " + desc + " -> " + e);
+                log(DEBUG, TAG, "[DBG] hook FAIL: " + desc + " -> " + t);
             }
         }
     }
 
-    /** 按 类名+方法名+参数类型数组 精确 hook（方法重载/混淆同名多参时用，替代上面简单按名匹配）。 */
-    protected void hookMethodBySig(ClassLoader cl, String clsName, String methodName,
-                                   Class<?>[] paramTypes, XposedInterface.Hooker hooker) {
-        String desc = clsName + "#" + methodName;
+    // ===== 工具 =====
+
+    /** http/https 判定（WebDAV 走这两个 scheme）。 */
+    static boolean isHttpUrl(String s) {
+        if (s == null) {
+            return false;
+        }
+        String low = s.toLowerCase();
+        return low.startsWith("http://") || low.startsWith("https://");
+    }
+
+    private static String name(Class<?> c) {
+        return c == null ? "null" : c.getName();
+    }
+
+    private static String readStringField(Object obj, String field) {
+        if (obj == null) {
+            return "null";
+        }
         try {
-            Class<?> cls = cl.loadClass(clsName);
-            Method target = cls.getDeclaredMethod(methodName, paramTypes);
-            target.setAccessible(true);
-            hook(target).intercept(hooker);
-            sHookOk++;
-            sHookDetail.append("\n[OK] ").append(desc);
-            if (BuildConfig.DEBUG) {
-                log(DEBUG, TAG, "[DBG] hook installed OK(sig): " + desc);
-            }
-        } catch (Throwable e) {
-            sHookFail++;
-            sHookDetail.append("\n[FAIL] ").append(desc).append(": ").append(e.getMessage());
-            if (BuildConfig.DEBUG) {
-                log(DEBUG, TAG, "[DBG] hook install FAIL(sig): " + desc + " -> " + e);
-            }
+            Field f = obj.getClass().getField(field);
+            Object v = f.get(obj);
+            return v == null ? "null" : v.toString();
+        } catch (Throwable t) {
+            return "<err:" + t.getClass().getSimpleName() + ">";
+        }
+    }
+
+    private static int readIntField(Object obj, String field) {
+        if (obj == null) {
+            return Integer.MIN_VALUE;
+        }
+        try {
+            Field f = obj.getClass().getField(field);
+            return f.getInt(obj);
+        } catch (Throwable t) {
+            return Integer.MIN_VALUE;
         }
     }
 }
