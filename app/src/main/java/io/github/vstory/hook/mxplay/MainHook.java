@@ -209,10 +209,18 @@ public class MainHook extends XposedModule {
         }
     }
 
-    /** 打印定位明细（D 级：调用点必须包在 {@code if (BuildConfig.DEBUG)} 里，release 编译期消除）。 */
+    /**
+     * 打印定位明细。
+     *
+     * <p>D 级日志一律写在调用点的 {@code if (BuildConfig.DEBUG)} 块内 —— 本项目 release 不启用
+     * minify，变体裁剪完全靠 javac 消除该块；写成复合条件（{@code A && BuildConfig.DEBUG}）虽当前
+     * 也被折叠掉，但不是规范形态，会让「逐调用点核对」的检查出现假阳性。
+     */
     private void flushDiag(String phase) {
-        if (HookTargets.DIAG.length() > 0 && BuildConfig.DEBUG) {
-            log(DEBUG, TAG, "[DBG] [locate] " + phase + "明细:\n" + HookTargets.DIAG);
+        if (BuildConfig.DEBUG) {
+            if (HookTargets.DIAG.length() > 0) {
+                log(DEBUG, TAG, "[DBG] [locate] " + phase + "明细:\n" + HookTargets.DIAG);
+            }
         }
     }
 
