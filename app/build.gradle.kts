@@ -38,6 +38,14 @@ android {
         }
     }
     buildTypes {
+        // 两个变体都挂同一把固定密钥：测试包才能直接覆盖升级。
+        // 若测试版用 AGP 的调试签名，每次 CI 运行的调试密钥都不同 ⇒ 每次安装都得先卸载，
+        // 而卸载会在 LSPosed 里丢掉「已启用 + 已勾作用域」，是本项目反复测试时最费事的一步。
+        debug {
+            if (hasSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
+        }
         release {
             isMinifyEnabled = false
             if (hasSigning) {

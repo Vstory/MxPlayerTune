@@ -104,28 +104,42 @@ jobs:
           echo "short=${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
           echo "ts=$(TZ=Asia/Shanghai date -d "@$NOW" +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
 
-      # 签名：当前一律**一次性随机 keystore**（每次产物指纹不同，装前须卸载旧版）。
-      #   接入固定签名后，本步骤改为从 secrets 解码固定 keystore —— 只改这一段，
-      #   工作流其余部分与 app/build.gradle.kts 都不用动（它只认 local.properties 的那四个键）。
-      #   ⚠️ keytool 生成时**不要**单独给 -keypass：JKS 中 key 口令默认等于 store 口令；
-      #   两者不等时 AGP 用 storePassword 解 key 会报 "Given final block not properly padded"。
-      - name: Prepare signing (random keystore)
-        if: github.event.inputs.build_type == 'release'
+      # 签名：从仓库 secrets 解码**固定密钥**。测试版与正式版**共用同一把** —— 这样测试包能直接
+      #   覆盖升级、不必卸载；而卸载会在 LSPosed 里丢掉「已启用 + 已勾作用域」的状态，是本项目
+      #   反复装测试包时最费事的一步。
+      #   secrets 名：KEY_BASE64 / SIGNING_STORE_PASSWORD / SIGNING_KEY_ALIAS / SIGNING_KEY_PASSWORD
+      #   ⚠️ secret 一律经 env 传入、run 脚本里**只引用变量名** —— 不把 ${{ secrets.X }} 写进 run 正文：
+      #      值里若含 `$` 或反引号会被 shell 二次展开（实测口令含 $ 时被吃成前半截，且在签名报错前毫无提示）。
+      #   ⚠️ 缺 secret 时**直接失败**，不回退到调试签名 —— 回退的后果是产物看着"构建成功"、
+      #      签名却不对，要等安装升级时才发现。
+      #   ⚠️ 本步骤对两个渠道都执行（debug 变体也挂同一个 signingConfig，见 app/build.gradle.kts）。
+      - name: Prepare signing (fixed key from secrets)
+        env:
+          KEY_BASE64: ${{ secrets.KEY_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
-          SP="$(openssl rand -hex 16)"
-          KS="$GITHUB_WORKSPACE/ci-release.jks"
-          keytool -genkeypair -v -keystore "$KS" \
-            -storepass "$SP" \
-            -alias mxplay \
-            -keyalg RSA -keysize 2048 -validity 3650 \
-            -dname "CN=MxPlayerTune CI $(date +%s), O=MxPlayerTune Dev, C=CN" >/dev/null 2>&1
+          missing=""
+          for v in KEY_BASE64 STORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            [ -n "${!v}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::缺少签名 secret:$missing —— 拒绝回退到调试签名（那会让产物无法覆盖升级）"
+            exit 1
+          fi
+
+          KS="$GITHUB_WORKSPACE/ci-signing.jks"
+          printf '%s' "$KEY_BASE64" | base64 -d > "$KS"
+          # storeFile 由 runner 现场拼（$GITHUB_WORKSPACE），不写死 runner 上的仓库路径名，
+          # 改名/换布局都不会失配。
           {
             printf 'storeFile=%s\n' "$KS"
-            printf 'storePassword=%s\n' "$SP"
-            printf 'keyAlias=%s\n' mxplay
-            printf 'keyPassword=%s\n' "$SP"
+            printf 'storePassword=%s\n' "$STORE_PASSWORD"
+            printf 'keyAlias=%s\n' "$KEY_ALIAS"
+            printf 'keyPassword=%s\n' "$KEY_PASSWORD"
           } >> local.properties
-          echo "已生成一次性随机签名（指纹每次不同，属预期）"
+          echo "已按固定密钥配置签名（测试版与正式版共用同一把）"
 
       - name: Gradle build
         env:
@@ -204,8 +218,21 @@ jobs:
           # （只取第一条 SHA-256；下面还要求非空，故格式再变也只会失败在这里而不是静默放行）
           DIGEST="$(printf '%s' "$OUT" | sed -nE 's/^.*certificate SHA-256 digest: ([0-9a-fA-F]+).*$/\1/p' | head -1)"
           [ -n "$DIGEST" ] || { echo "::error::读不到签名证书指纹（apksigner 未能解析产物）"; printf '%s\n' "$OUT"; exit 1; }
-          echo "✅ 签名有效，证书 SHA-256 = $DIGEST"
-          echo "CERT_SHA256=$DIGEST" >> "$GITHUB_ENV"
+
+          # 断言确实是**固定密钥**签的 —— 拦「secrets 缺失/写错而落到调试签名」这类静默错误：
+          #   它不会让构建失败，只会让产物装不上，等于错误在用户侧才暴露。
+          #   ⚠️ 换签名密钥时须同步改本行（新指纹取法：keytool -list -v 的 SHA256）。
+          EXPECTED_CERT_SHA256="52BCAA9D01539FFDB0C97D30F6C41A418CED5C42E4F77E5D284FC96E3ED13464"
+          ACTUAL="$(printf '%s' "$DIGEST" | tr -d ':' | tr 'a-f' 'A-F')"
+          if [ "$ACTUAL" != "$EXPECTED_CERT_SHA256" ]; then
+            echo "::error::签名指纹与固定密钥不符 —— 拒绝发布"
+            echo "  期望: $EXPECTED_CERT_SHA256"
+            echo "  实际: $ACTUAL"
+            echo "  排查：① 仓库 secrets 是否被清空/写错 ② 若确已轮换密钥，本处期望值需同步更新"
+            exit 1
+          fi
+          echo "✅ 签名有效，且指纹与固定密钥一致：$ACTUAL"
+          echo "CERT_SHA256=$ACTUAL" >> "$GITHUB_ENV"
 
       # 发布目标：测试版 → 滚动预发布 tag `snapshot`（下载入口固定）；正式版 → tag v<versionName>。
       - name: Resolve release target
@@ -237,9 +264,9 @@ jobs:
         run: |
           CHANNEL="${{ steps.target.outputs.channel }}"
           if [ "$CHANNEL" = "release" ]; then
-            SIGN_NOTE="⚠️ 本次为**一次性随机临时签名**（固定密钥尚未接入）。安装前须先卸载旧版，否则签名不一致装不上。"
+            SIGN_NOTE="🔒 固定密钥签名，与测试版**同一把** ⇒ 可直接覆盖升级（无需卸载）。"
           else
-            SIGN_NOTE="⚠️ 测试版：debug 变体（保留调试日志），AGP 默认调试签名。安装前须先卸载旧版。"
+            SIGN_NOTE="🔒 测试版（debug 变体，保留调试日志），与正式版**同一把固定密钥** ⇒ 可直接覆盖升级（无需卸载；卸载会丢掉 LSPosed 里的启用状态）。"
           fi
           cat > release_body.md <<EOF
           **MxPlayerTune** · 渠道 \`${CHANNEL}\` · 提交 \`${{ steps.info.outputs.short }}\` · 构建时间（北京时间）\`${{ steps.info.outputs.ts }}\`
