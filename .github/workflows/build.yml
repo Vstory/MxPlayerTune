@@ -296,7 +296,7 @@ jobs:
         run: |
           TAG="${VER}_${{ steps.info.outputs.ts }}_${{ steps.info.outputs.short }}"
           echo "tag=${TAG}"                                   >> "$GITHUB_OUTPUT"
-          echo "name=MxPlayerTune ${VER} (${{ steps.info.outputs.ts }})" >> "$GITHUB_OUTPUT"
+          echo "name=${VER} (${{ steps.info.outputs.ts }})" >> "$GITHUB_OUTPUT"
           echo "→ tag=${TAG}"
 
       - name: Generate release body
@@ -305,7 +305,7 @@ jobs:
           SHORT: ${{ steps.info.outputs.short }}
         run: |
           cat > release_body.md <<EOF
-          **MxPlayerTune** ${VER} · 提交 \`${SHORT}\` · 构建时间（北京时间）\`${TS}\`
+          **MxPlayerTune** ${VER} · 提交 [\`${SHORT}\`](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}) · 构建时间（北京时间）\`${TS}\`
 
           本次构建产出**两个包**，两者**同一把固定密钥**签名 ⇒ 装哪个都能被下一次直接覆盖升级，**不必先卸载**（卸载会丢掉 LSPosed 里的启用状态）：
 
