@@ -52,6 +52,7 @@ MX Player 增强模块（libxposed API 102 / LSPosed）：让 MX Player 的「�
 - 装好并重启 MX Player 后，日志依次出现 `api102 module loaded` → `[locate] …` → `installHooks done: 2 OK / 0 FAIL` = **注入、目标定位、两个 hook 均成功**
 - 进「本地网络」点开 WebDAV 服务器后，日志出现 `[webdav] RemoteDataSource#listDir path=… → 子项 n（目录 m）… 返回 k 项` = **列目录成功**（`k` 为过滤后交给界面的条目数）
 - `[webdav] 列目录失败 path=…` = 列目录报错，同一条日志带 HTTP 状态或异常原因（`401/403` 查账号密码与匿名勾选，`404` 查地址与结尾斜杠）
+- debug 版若**一个 hook 调用都没有**（连 `[DBG] >>` 都没有）→ 不是 hook 失效，而是**目录列举没被触发**：只停在「本地网络」列表页不算进入目录；目录页**有缓存**时也不会重新列举，**下拉刷新**可强制重新列举
 - 日志完全无 `MxPlayerTune` → 模块未启用或未生效（检查 LSPosed 中的启用状态与作用域）
 
 ## 版本
