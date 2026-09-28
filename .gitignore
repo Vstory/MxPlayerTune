@@ -4,6 +4,7 @@ dev-project/tokens
 # ==== 构建产物 / 中间文件 ====
 build/
 .gradle/
+.kotlin/
 dev-project/releases/
 *.idsig
 local.properties
@@ -13,3 +14,8 @@ dev-project/
 
 # ==== 项目状态标记 ====
 .deving
+
+# ==== IDE 工程文件 ====
+.idea/
+*.iml
+captures/
