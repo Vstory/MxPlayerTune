@@ -5,6 +5,8 @@ plugins {
 android {
     namespace = "io.github.vstory.hook.mxplay"
     compileSdk = 37
+    // 本机只装了 arm64 build-tools 37.0.0（Commit451 版）；不指定则 AGP 会去装 x86_64 的 36.0.0
+    buildToolsVersion = "37.0.0"
 
     defaultConfig {
         applicationId = "io.github.vstory.hook.mxplay"
