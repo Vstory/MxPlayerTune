@@ -1,0 +1,323 @@
+name: Build
+
+# 运行标题：多跑几次时用于辨认批次（渠道 + 分支）。
+run-name: "Build · ${{ github.event.inputs.build_type == 'release' && 'Release' || 'Test' }} · ${{ github.ref_name }}"
+
+# 触发：
+#   - push main → 自动出**测试版**（无需人工，日常改完即得可装包）
+#   - 手动 → 可选 test / release
+# 纯文档改动不重建（无产物价值，白耗额度）。
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: '构建类型: test=测试版(debug 变体,含调试日志) / release=正式版(随机临时签名,待接入固定密钥)'
+        required: true
+        default: test
+        type: choice
+        options:
+          - test
+          - release
+
+# 并发：同一渠道串行排队，避免两次运行同时往同一个 Release 上传/清理。
+# 不用 cancel-in-progress —— 中途取消可能留下半个上传状态。
+concurrency:
+  group: build-${{ github.ref }}-${{ github.event.inputs.build_type || 'test' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # 发布 Release 需要写权限
+
+# 供应链加固：第三方 action 一律钉到 commit SHA（可变 tag 被上游改动/账号被盗后投毒的风险）。
+# SHA 取自 RikkaHub-X 现役工作流（同账号、已验证可用）与 actions 官方 tag 解析值。
+env:
+  JAVA_VERSION: '17'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      # Android SDK：项目 compileSdk=37 + buildToolsVersion=37.0.0，runner 预装镜像里没有。
+      #   ⚠️ platform-37 在官方仓库里是**带小数**的名字（platforms;android-37.2），
+      #   `platforms;android-37` 不存在；而 AGP 按 compileSdk=37 找的是 platforms/android-37 目录
+      #   ⇒ 装完必须归位目录名（与开发机手工安装同一套做法）。
+      - name: Set up Android SDK 37
+        run: |
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKM="$(command -v sdkmanager || echo "$SDK/cmdline-tools/latest/bin/sdkmanager")"
+          echo "SDK=$SDK"
+          echo "sdkmanager=$SDKM"
+
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          "$SDKM" "build-tools;37.0.0" >/dev/null 2>&1 \
+            || sudo "$SDKM" "build-tools;37.0.0" >/dev/null 2>&1 || true
+
+          if [ ! -f "$SDK/platforms/android-37/android.jar" ]; then
+            echo "安装 platform 37（手动解压 + 归位目录名）"
+            curl -fsSL -o /tmp/platform-37.zip \
+              "https://dl.google.com/android/repository/platform-37.2_r01.zip"
+            rm -rf /tmp/p37 && mkdir -p /tmp/p37
+            unzip -q /tmp/platform-37.zip -d /tmp/p37
+            sudo mkdir -p "$SDK/platforms"
+            sudo rm -rf "$SDK/platforms/android-37"
+            sudo mv /tmp/p37/android-37.2 "$SDK/platforms/android-37"
+          fi
+
+          # 断言：缺一即在此失败，不留到 Gradle 报含糊错
+          test -f "$SDK/platforms/android-37/android.jar" \
+            || { echo "::error::platforms/android-37 就位失败"; exit 1; }
+          test -x "$SDK/build-tools/37.0.0/aapt2" \
+            || { echo "::error::build-tools 37.0.0 就位失败"; exit 1; }
+          echo "platforms: $(ls "$SDK/platforms" | tr '\n' ' ')"
+          echo "build-tools: $(ls "$SDK/build-tools" | tr '\n' ' ')"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+
+      - name: Gradle cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Compute build info
+        id: info
+        run: |
+          NOW=$(date +%s)
+          echo "short=${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
+          echo "ts=$(TZ=Asia/Shanghai date -d "@$NOW" +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
+
+      # 签名：当前一律**一次性随机 keystore**（每次产物指纹不同，装前须卸载旧版）。
+      #   接入固定签名后，本步骤改为从 secrets 解码固定 keystore —— 只改这一段，
+      #   工作流其余部分与 app/build.gradle.kts 都不用动（它只认 local.properties 的那四个键）。
+      #   ⚠️ keytool 生成时**不要**单独给 -keypass：JKS 中 key 口令默认等于 store 口令；
+      #   两者不等时 AGP 用 storePassword 解 key 会报 "Given final block not properly padded"。
+      - name: Prepare signing (random keystore)
+        if: github.event.inputs.build_type == 'release'
+        run: |
+          SP="$(openssl rand -hex 16)"
+          KS="$GITHUB_WORKSPACE/ci-release.jks"
+          keytool -genkeypair -v -keystore "$KS" \
+            -storepass "$SP" \
+            -alias mxplay \
+            -keyalg RSA -keysize 2048 -validity 3650 \
+            -dname "CN=MxPlayerTune CI $(date +%s), O=MxPlayerTune Dev, C=CN" >/dev/null 2>&1
+          {
+            printf 'storeFile=%s\n' "$KS"
+            printf 'storePassword=%s\n' "$SP"
+            printf 'keyAlias=%s\n' mxplay
+            printf 'keyPassword=%s\n' "$SP"
+          } >> local.properties
+          echo "已生成一次性随机签名（指纹每次不同，属预期）"
+
+      - name: Gradle build
+        env:
+          BUILD_TYPE: ${{ github.event.inputs.build_type || 'test' }}
+        run: |
+          chmod +x gradlew
+          if [ "$BUILD_TYPE" = "release" ]; then
+            ./gradlew --no-daemon :app:assembleRelease
+            SRC=app/build/outputs/apk/release
+          else
+            ./gradlew --no-daemon :app:assembleDebug
+            SRC=app/build/outputs/apk/debug
+          fi
+          echo "SRC=$SRC" >> "$GITHUB_ENV"
+          ls -la "$SRC"
+
+      # 产物命名：<模块名>_<构建时间(北京时间)>_<渠道>_<短提交号>.apk
+      #   时间戳在前便于肉眼按批次辨认；短号用于对应 commit。
+      - name: Rename APK and assert naming rule
+        env:
+          BUILD_TYPE: ${{ github.event.inputs.build_type || 'test' }}
+        run: |
+          CHANNEL="$BUILD_TYPE"
+          TS="${{ steps.info.outputs.ts }}"
+          SHORT="${{ steps.info.outputs.short }}"
+          mkdir -p dist
+          n=0
+          for f in "$SRC"/*.apk; do
+            [ -e "$f" ] || continue
+            NAME="MxPlayerTune_${TS}_${CHANNEL}_${SHORT}.apk"
+            cp -- "$f" "dist/$NAME"
+            n=$((n + 1))
+            echo "产物: dist/$NAME（源 $(basename "$f")）"
+          done
+          [ "$n" -ge 1 ] || { echo "::error::未找到任何 APK 产物"; exit 1; }
+
+          # 命名自检：本文件的发布/清理步骤都按该规则解析文件名，改名漏改会静默错（404 / 永不被清理）
+          for f in dist/*.apk; do
+            printf '%s' "$(basename "$f")" \
+              | grep -qE '^MxPlayerTune_[0-9]{8}-[0-9]{4}_(test|release)_[0-9a-f]{8}\.apk$' \
+              || { echo "::error::产物命名不符合规则: $(basename "$f")"; exit 1; }
+          done
+          echo "✅ 命名自检通过（$n 个）"
+          ls -la dist
+
+      # 断言产物真的可用：三件套齐全 + **真的被签名**。
+      #   ⚠️ 为什么必须断言签名：AGP 在 signingConfig 缺失时**不报错**，而是产出 app-release-unsigned.apk；
+      #   不拦就会把一个装不上的包发出去。
+      - name: Verify APK (xposed files + signature)
+        env:
+          BUILD_TYPE: ${{ github.event.inputs.build_type || 'test' }}
+        run: |
+          APK="$(ls dist/*.apk | head -1)"
+          echo "校验 $APK"
+
+          MISSING=""
+          for e in META-INF/xposed/java_init.list META-INF/xposed/module.prop META-INF/xposed/scope.list; do
+            unzip -l "$APK" | grep -q "$e" || MISSING="$MISSING $e"
+          done
+          [ -z "$MISSING" ] || { echo "::error::APK 缺 libxposed 三件套:$MISSING（LSPosed 不会识别为模块）"; exit 1; }
+          echo "✅ META-INF/xposed 三件套齐全"
+
+          APKSIGNER="$(command -v apksigner || true)"
+          [ -n "$APKSIGNER" ] || APKSIGNER="$(ls -d "$ANDROID_SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)"
+          [ -n "$APKSIGNER" ] || { echo "::error::找不到 apksigner，无法断言签名 —— 拒绝发布"; exit 1; }
+
+          OUT="$("$APKSIGNER" verify --print-certs "$APK" 2>&1 || true)"
+          if printf '%s' "$OUT" | grep -qi 'DOES NOT VERIFY\|Missing.*signature'; then
+            echo "::error::产物未通过签名校验 —— 拒绝发布（release 变体是否漏配 signingConfig？）"
+            printf '%s\n' "$OUT"
+            exit 1
+          fi
+          DIGEST="$(printf '%s' "$OUT" | sed -nE 's/^Signer #1 certificate SHA-256 digest: (.*)$/\1/p' | head -1)"
+          [ -n "$DIGEST" ] || { echo "::error::读不到签名证书指纹（apksigner 未能解析产物）"; printf '%s\n' "$OUT"; exit 1; }
+          echo "✅ 签名有效，证书 SHA-256 = $DIGEST"
+          echo "CERT_SHA256=$DIGEST" >> "$GITHUB_ENV"
+
+      # 发布目标：测试版 → 滚动预发布 tag `snapshot`（下载入口固定）；正式版 → tag v<versionName>。
+      - name: Resolve release target
+        id: target
+        env:
+          BUILD_TYPE: ${{ github.event.inputs.build_type || 'test' }}
+        run: |
+          if [ "$BUILD_TYPE" = "release" ]; then
+            VER="$(sed -nE 's/^[[:space:]]*versionName = "([^"]+)".*/\1/p' app/build.gradle.kts | head -1)"
+            [ -n "$VER" ] || { echo "::error::读不到 versionName，拒绝用空版本号打 tag"; exit 1; }
+            echo "tag=v${VER}"        >> "$GITHUB_OUTPUT"
+            echo "name=MxPlayerTune v${VER}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false"   >> "$GITHUB_OUTPUT"
+            echo "make_latest=true"   >> "$GITHUB_OUTPUT"
+            echo "channel=release"    >> "$GITHUB_OUTPUT"
+            echo "→ 正式版 tag=v${VER}"
+          else
+            echo "tag=snapshot"          >> "$GITHUB_OUTPUT"
+            echo "name=Snapshot Build"   >> "$GITHUB_OUTPUT"
+            echo "prerelease=true"       >> "$GITHUB_OUTPUT"
+            echo "make_latest=false"     >> "$GITHUB_OUTPUT"
+            echo "channel=test"          >> "$GITHUB_OUTPUT"
+            echo "→ 测试版 tag=snapshot（滚动预发布）"
+          fi
+
+      - name: Generate release body
+        env:
+          BUILD_TYPE: ${{ github.event.inputs.build_type || 'test' }}
+        run: |
+          CHANNEL="${{ steps.target.outputs.channel }}"
+          if [ "$CHANNEL" = "release" ]; then
+            SIGN_NOTE="⚠️ 本次为**一次性随机临时签名**（固定密钥尚未接入）。安装前须先卸载旧版，否则签名不一致装不上。"
+          else
+            SIGN_NOTE="⚠️ 测试版：debug 变体（保留调试日志），AGP 默认调试签名。安装前须先卸载旧版。"
+          fi
+          cat > release_body.md <<EOF
+          **MxPlayerTune** · 渠道 \`${CHANNEL}\` · 提交 \`${{ steps.info.outputs.short }}\` · 构建时间（北京时间）\`${{ steps.info.outputs.ts }}\`
+
+          ${SIGN_NOTE}
+
+          - 签名证书 SHA-256：\`${CERT_SHA256:-（未读取到）}\`
+          - 目标应用：MX Player Pro \`com.mxtech.videoplayer.pro\`（作用域已静态声明，无需手动勾选）
+          - 当前功能状态：**阶段 A（探针）** —— 仅验证模块注入与目标定位，尚未实现 WebDAV 浏览；安装后在 LSPosed 启用本模块并重启 MX Player，日志 tag \`MxPlayerTune\`
+          - 构建来源：\`${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\`
+          EOF
+          cat release_body.md
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: MxPlayerTune-${{ steps.target.outputs.channel }}-${{ steps.info.outputs.short }}
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Publish release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          tag_name: ${{ steps.target.outputs.tag }}
+          name: ${{ steps.target.outputs.name }}
+          prerelease: ${{ steps.target.outputs.prerelease }}
+          make_latest: ${{ steps.target.outputs.make_latest }}
+          body_path: release_body.md
+          files: dist/*.apk
+
+      # 清理：保留最新 3 组构建，其余删除。
+      #   用「按构建时间保留最新 N 组」这个**幂等不变式**，不用「总数 − N」计数法 ——
+      #   计数法基于某一时刻快照，并发运行会叠加多删；且重复删除返回 404 会让步骤误报失败。
+      #   性质：任何交错都收敛到同一稳态，且最新构建必在保留集内（永不删到更新的产物）。
+      - name: Cleanup old assets (keep latest 3)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          sleep 15   # 等本次上传的 asset 在 API 中可见
+
+          mapfile -t ASSETS < <(gh api --paginate \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${{ github.repository }}/releases/tags/${TARGET_TAG}" \
+            --jq '.assets[] | select(.name | test("^MxPlayerTune_[0-9]{8}-[0-9]{4}_(test|release)_[0-9a-f]{8}\\.apk$")) | [.id, .name] | @tsv')
+          echo "匹配命名规则的 asset 共 ${#ASSETS[@]} 个"
+
+          key_of() {
+            sed -nE 's/^MxPlayerTune_([0-9]{8}-[0-9]{4})_(test|release)_([0-9a-f]{8})\.apk$/\1 \3/p' <<< "$1"
+          }
+
+          KEYS_FILE="$(mktemp)"
+          while IFS=$'\t' read -r _id name; do
+            [ -n "$name" ] || continue
+            key_of "$name"
+          done < <(printf '%s\n' "${ASSETS[@]}") | sort -u -r > "$KEYS_FILE"
+
+          declare -A KEEP=()
+          kept=0
+          while read -r k; do
+            [ -n "$k" ] || continue
+            [ "$kept" -ge 3 ] && break
+            KEEP["$k"]=1
+            kept=$((kept + 1))
+          done < "$KEYS_FILE"
+          echo "保留最新 $kept 组：$(tr '\n' ' ' < "$KEYS_FILE" | cut -c1-200)"
+
+          deleted=0
+          failed=0
+          while IFS=$'\t' read -r id name; do
+            [ -n "$id" ] || continue
+            k="$(key_of "$name")"
+            if [ -n "$k" ] && [ -n "${KEEP[$k]:-}" ]; then continue; fi
+            if gh api -X DELETE -H "Accept: application/vnd.github+json" \
+                 "repos/${{ github.repository }}/releases/assets/$id" >/dev/null 2>&1; then
+              deleted=$((deleted + 1))
+            else
+              failed=$((failed + 1))
+            fi
+          done < <(printf '%s\n' "${ASSETS[@]}")
+          rm -f "$KEYS_FILE"
+
+          echo "已删除 $deleted 个旧 asset"
+          [ "$failed" -eq 0 ] || echo "::notice::$failed 个删除失败（并发下被另一次运行抢先删除会返回 404，属正常）"
