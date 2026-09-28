@@ -193,12 +193,16 @@ jobs:
           [ -n "$APKSIGNER" ] || { echo "::error::找不到 apksigner，无法断言签名 —— 拒绝发布"; exit 1; }
 
           OUT="$("$APKSIGNER" verify --print-certs "$APK" 2>&1 || true)"
-          if printf '%s' "$OUT" | grep -qi 'DOES NOT VERIFY\|Missing.*signature'; then
+          if printf '%s' "$OUT" | grep -qi 'DOES NOT VERIFY\|Missing.*signature\|no signature'; then
             echo "::error::产物未通过签名校验 —— 拒绝发布（release 变体是否漏配 signingConfig？）"
             printf '%s\n' "$OUT"
             exit 1
           fi
-          DIGEST="$(printf '%s' "$OUT" | sed -nE 's/^Signer #1 certificate SHA-256 digest: (.*)$/\1/p' | head -1)"
+          # 指纹行格式随 build-tools 版本变化，两种都认：
+          #   旧：Signer #1 certificate SHA-256 digest: <hex>
+          #   37：V2 Signer: certificate SHA-256 digest: <hex>
+          # （只取第一条 SHA-256；下面还要求非空，故格式再变也只会失败在这里而不是静默放行）
+          DIGEST="$(printf '%s' "$OUT" | sed -nE 's/^.*certificate SHA-256 digest: ([0-9a-fA-F]+).*$/\1/p' | head -1)"
           [ -n "$DIGEST" ] || { echo "::error::读不到签名证书指纹（apksigner 未能解析产物）"; printf '%s\n' "$OUT"; exit 1; }
           echo "✅ 签名有效，证书 SHA-256 = $DIGEST"
           echo "CERT_SHA256=$DIGEST" >> "$GITHUB_ENV"
