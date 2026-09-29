@@ -29,6 +29,15 @@ final class LogBudget {
     /** hook ③：缩略图 URL 构造。 */
     static final LogBudget THUMB_URL = new LogBudget(3);
 
+    /** 环回缩略图服务：每个请求一行（200 / 命中缓存 / 404）。 */
+    static final LogBudget THUMB_SERVE = new LogBudget(8);
+
+    /** 环回缩略图服务：渲染成功一行（含耗时与**实际走的那条取流路径**）。 */
+    static final LogBudget THUMB_RENDER = new LogBudget(6);
+
+    /** 环回缩略图服务：渲染失败一行 —— 宿主只会显示占位图、不报错，这一行是唯一线索，给足。 */
+    static final LogBudget THUMB_FAIL = new LogBudget(8);
+
     private final int max;
     private int used;
 

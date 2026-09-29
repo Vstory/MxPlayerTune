@@ -66,6 +66,16 @@ final class WebDavClient {
     /** 与 MX 自身 SMB 超时同量级（{@code SMB2Client.setTimeout(10000)}）。 */
     static final int TIMEOUT_MS = 10_000;
 
+    /**
+     * 抽帧（{@link RangeSource}）那一路的**读**超时：刻意比列目录宽得多。
+     *
+     * <p>真机实测（2026-09-29，直打本机 CloudDrive，同一个 338 MB 的 mp4）：
+     * 顺序区读 64 KiB 只要 0.1–0.7 s，但<b>文件中间区域</b>的一次随机读要 <b>~10.07 s</b>
+     * （上云服务端要先去上游 seek）。用列目录那条 10 s 超时，抽取器一次深跳就必然超时
+     * ⇒ 又变回「缩略图空白且什么都不报」。
+     */
+    static final int FETCH_READ_TIMEOUT_MS = 30_000;
+
     /** PROPFIND 请求体：只要 resourcetype（判目录）与 getcontentlength。 */
     static final String PROPFIND_BODY =
             "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
@@ -85,6 +95,9 @@ final class WebDavClient {
 
     /** 共享客户端（懒建）：连接池与线程池因此有界，不在宿主进程里反复新建。 */
     private static OkHttpClient sClient;
+
+    /** 抽帧取流专用的共享客户端（同配置，只把读超时放宽；见 {@link #FETCH_READ_TIMEOUT_MS}）。 */
+    private static OkHttpClient sFetchClient;
 
     /** https 宽松校验的 Socket 工厂（懒建；null = 不可用，退回严格校验）。 */
     private static SSLSocketFactory sRelaxFactory;
@@ -173,26 +186,53 @@ final class WebDavClient {
      */
     private static synchronized OkHttpClient client() {
         if (sClient == null) {
-            OkHttpClient.Builder b = new OkHttpClient.Builder()
-                    .connectTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
-                    .readTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
-                    .writeTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
-                    .protocols(Collections.singletonList(Protocol.HTTP_1_1));
-            SSLSocketFactory f = relaxFactory();
-            if (f != null) {
-                // OkHttp 要求 socket 工厂与 trustManager 成对传入（它要拿 trustManager 做主机名校验）
-                b.sslSocketFactory(f, TRUST_ALL);
-                b.hostnameVerifier(new javax.net.ssl.HostnameVerifier() {
-                    @Override
-                    public boolean verify(String hostname, javax.net.ssl.SSLSession session) {
-                        return true;
-                    }
-                });
-                note("https: 已放宽证书校验（自签名 / 私有 CA 可用；仅本客户端）");
-            }
-            sClient = b.build();
+            sClient = build(TIMEOUT_MS);
         }
         return sClient;
+    }
+
+    /**
+     * 列目录用的共享客户端（可见入口：抽帧与列目录必须是**同一套** TLS 语义
+     * —— 同一个 socket 工厂与 trustManager，否则会出现「能列目录、能取图，就是缩略图空白」）。
+     */
+    static OkHttpClient httpClient() {
+        return client();
+    }
+
+    /**
+     * 抽帧分片取流用的客户端（懒建、加锁）：配置与 {@link #client()} 完全一致，只有**读超时更宽**。
+     *
+     * <p>为什么不共用一条：列目录想要「快到点就报错」（与 MX 的 SMB 超时同量级），而抽帧的
+     * 一次深跳随机读在真机上实测要 ~10 s ⇒ 同一条超时会把抽帧打成「永远超时」。
+     * 分开成两条，两边的取舍各自成立，也从构造上避免「为了抽帧把列目录也拖成 30 s」。
+     */
+    static synchronized OkHttpClient fetchClient() {
+        if (sFetchClient == null) {
+            sFetchClient = build(FETCH_READ_TIMEOUT_MS);
+        }
+        return sFetchClient;
+    }
+
+    /** 建客户端（两条共享客户端只差读超时这一个参数：TLS 放宽与协议版本完全一致）。 */
+    private static OkHttpClient build(long readTimeoutMs) {
+        OkHttpClient.Builder b = new OkHttpClient.Builder()
+                .connectTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                .readTimeout(readTimeoutMs, TimeUnit.MILLISECONDS)
+                .writeTimeout(TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                .protocols(Collections.singletonList(Protocol.HTTP_1_1));
+        SSLSocketFactory f = relaxFactory();
+        if (f != null) {
+            // OkHttp 要求 socket 工厂与 trustManager 成对传入（它要拿 trustManager 做主机名校验）
+            b.sslSocketFactory(f, TRUST_ALL);
+            b.hostnameVerifier(new javax.net.ssl.HostnameVerifier() {
+                @Override
+                public boolean verify(String hostname, javax.net.ssl.SSLSession session) {
+                    return true;
+                }
+            });
+            note("https: 已放宽证书校验（自签名 / 私有 CA 可用；仅本客户端）");
+        }
+        return b.build();
     }
 
     /**

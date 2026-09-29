@@ -29,8 +29,10 @@ import io.github.libxposed.api.XposedModuleInterface;
  *       {@code Authorization: Basic …} 选项 —— URL 里没有 userinfo 就等于播放不带鉴权</li>
  *   <li>RemoteDataSource 的目录列举静态方法 —— path 为 http(s) 时走 PROPFIND 列目录，
  *       否则原样放行（SMB 功能不受影响）</li>
- *   <li>{@code SmbUtil} 的缩略图 URL 构造方法 —— 对 http(s) 直接返回条目 {@code path}
- *       （MX 自己重建 URL 时用 {@code getHost()+getPath()} ⇒ 丢端口，非 80/443 必然拿不到缩略图）</li>
+ *   <li>{@code SmbUtil} 的缩略图 URL 构造方法 —— 对 http(s) 的**视频**条目返回我们自己起的
+ *       环回缩略图服务 URL（{@link ThumbServer}）：宿主取的是条目自身 URL、且整片下载不发
+ *       {@code Range} ⇒ 只有把「一张真 JPEG」放到它面前才可能出图；
+ *       非视频 / 服务未起来时退回条目 {@code path}</li>
  *   <li>{@code java.net.URL#openConnection()} —— 图片/缩略图取流补 {@code Authorization}：
  *       宿主的图片取流是<b>裸</b> {@code HttpURLConnection}，<b>不</b>把 URL 里的 userinfo
  *       变成鉴权头 ⇒ 否则「能列目录、能播放，只有缩略图空白」（见 {@link #hookUrlAuth}）</li>
@@ -79,6 +81,9 @@ public class MainHook extends XposedModule {
     private static Class<?> sSmbServerCls;
     private static Class<?> sRemoteDsCls;
     private static Class<?> sSmbUtilCls;
+
+    /** 环回缩略图服务（进程内唯一；起不来时保持 null ⇒ hook ③ 退回旧行为）。 */
+    private static ThumbServer sThumbServer;
 
     public MainHook() {
         super();
@@ -239,10 +244,11 @@ public class MainHook extends XposedModule {
         }
         hookDirectoryList(HookTargets.directoryListMethod(sRemoteDsCls, new String[]{"a"}), bound);
 
-        // hook ③：缩略图 URL 构造（http(s) 直接用条目 path，避免 MX 丢端口）
+        // hook ③：缩略图 URL 构造（视频条目 → 环回缩略图服务；否则条目 path）
         if (sSmbUtilCls == null) {
             sSmbUtilCls = HookTargets.smbUtil(sCl, sRemoteEntryCls);
         }
+        startThumbServer();
         hookThumbnailUrl(HookTargets.smbUtilBuildUrl(sSmbUtilCls));
 
         // hook ④：图片/缩略图取流补 Basic 鉴权（宿主的取流不认 URL 里的 userinfo）
@@ -633,10 +639,42 @@ public class MainHook extends XposedModule {
     /** 本 hook 的 DEBUG 明细只打前几次（列表页每次滚动都会调它，逐行打会淹掉日志）。 */
 
     /**
+     * 起环回缩略图服务（{@link ThumbServer}）；失败只是让 hook ③ 退回旧行为，不影响任何其它功能。
+     */
+    private void startThumbServer() {
+        if (sThumbServer != null) {
+            return;
+        }
+        sThumbServer = ThumbServer.start(new ThumbServer.Sink() {
+            @Override
+            public void info(String msg) {
+                log(INFO, TAG, msg);
+            }
+
+            @Override
+            public void debug(String msg) {
+                if (BuildConfig.DEBUG) {
+                    log(DEBUG, TAG, "[DBG] " + msg);
+                }
+            }
+
+            @Override
+            public void error(String msg, Throwable t) {
+                log(ERROR, TAG, msg, t);
+            }
+        }, new ThumbFrames());
+    }
+
+    /**
      * MX 生成缩略图 URL 时用 {@code uri.getHost() + uri.getPath()} 重建（丢端口、凭据取字段原值）。
      *
-     * <p>对 http(s) 条目直接用条目自己的 {@code path}：端口在、凭据在（hook ① 内联），
-     * 且这正是 MX 交给图片加载器的那串 URL。非 http(s) 一律放行（SMB 行为不变）。
+     * <p>对 http(s) 的**视频**条目返回环回缩略图服务的 URL：宿主取的是条目自身 URL、
+     * 且整片下载<b>不发 {@code Range}</b>（真机实测 {@code 200} + {@code len=391840912} + {@code video/mp4}），
+     * 它面对整片视频只能解码失败 ⇒ 只留占位图。环回服务用 {@code Range} 分片取流 + 抽帧，
+     * 把一张**真 JPEG** 放到宿主面前（宿主自己的图片加载器照旧工作，不需要它支持任何新东西）。
+     *
+     * <p>非 http(s)（SMB）、非视频、或服务未起来 ⇒ 一律退回旧行为（返回条目 {@code path}）：
+     * 那时最坏也就是今天的「空白缩略图」，绝不会影响浏览与播放。
      */
     private void hookThumbnailUrl(Method target) {
         final String desc = "SmbUtil#buildThumbUrl";
@@ -655,9 +693,23 @@ public class MainHook extends XposedModule {
                     if (!HookTargets.isHttpUrl(path)) {
                         return chain.proceed();
                     }
+                    ThumbServer server = sThumbServer;
+                    if (server != null && ThumbServer.isVideoPath(path)) {
+                        String[] cred = credentialsOf(entry);
+                        String url = server.urlFor(path, cred[0], cred[1]);
+                        if (url != null) {
+                            if (BuildConfig.DEBUG && LogBudget.THUMB_URL.take()) {
+                                log(DEBUG, TAG, "[DBG] >> " + desc + " 改用环回缩略图 url=" + url
+                                        + " ← path=" + RemoteEntries.maskUserInfo(path));
+                            }
+                            return url;
+                        }
+                    }
                     if (BuildConfig.DEBUG && LogBudget.THUMB_URL.take()) {
                         log(DEBUG, TAG, "[DBG] >> " + desc + " 改用条目 path="
-                                + RemoteEntries.maskUserInfo(path));
+                                + RemoteEntries.maskUserInfo(path)
+                                + (server == null ? "（环回服务未启动）"
+                                : (ThumbServer.isVideoPath(path) ? "" : "（非视频扩展名）")));
                     }
                     return path;
                 }
