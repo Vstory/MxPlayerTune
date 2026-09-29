@@ -84,4 +84,12 @@ dependencies {
     compileOnly(files("libs/libxposed/api.jar"))
     implementation(files("libs/libxposed/interface.jar"))
     implementation(files("libs/libxposed/service.jar"))
+
+    // WebDAV 传输：OkHttp **3.14.9（纯 Java）**。
+    //   为什么必须是它、为什么不上 4.x/5.x：见 WebDavClient 类注释与 CHANGELOG ——
+    //   平台的 setRequestMethod 有动词白名单（PROPFIND 被拒），而 Android 的 HttpsURLConnection
+    //   是委托壳（写壳不生效 ⇒ 请求以 POST 出去 ⇒ 服务端 501）。OkHttp 无白名单 ⇒ 该类问题消失。
+    //   版本：3.14.9 的 okhttp+okio dex 实测 441 KB（真机包 +361 KB）；
+    //        4.12.0 的 okhttp+okio-jvm 单独就 1.08 MB（2.56 倍）⇒ 这一层只发一个 PROPFIND，取小的。
+    implementation("com.squareup.okhttp3:okhttp:3.14.9")
 }

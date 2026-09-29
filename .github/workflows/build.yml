@@ -297,6 +297,18 @@ jobs:
           echo "CERT_SHA256=${DIGEST_OF[release]}" >> "$GITHUB_ENV"
           echo "SIGN_SCHEMES=v2 + v3（v1 关：minSdk 26，无需 JAR 签名）" >> "$GITHUB_ENV"
 
+      # 断言 ⑦（变体裁剪）：debug 的 dex 必须有 D 级日志串，release **必须零命中**。
+      #   ⚠️ 为什么必须做成脚本、而不是「发布前看一眼」：release 漏出 "[DBG] ..." 是**静默**的，
+      #   APK 照样装照样跑，只是把一个只该存在于调试期的字符串发给了用户 —— review 看不出来。
+      #   2026-09-29 真漏过一次：某条 D 级日志写在**独立方法**里（调用点没有 if (BuildConfig.DEBUG)），
+      #   javac 裁剪不掉字符串常量 ⇒ release dex 里留下 "[DBG] << 取流判定 HTTP "。
+      #   所以判据是**读产物字节**，并且两边都要断言（只判 release 会漏掉「debug 也被削没了」那种）。
+      - name: Assert dex trim (assertion 7)
+        run: |
+          DEBUG_APK="$(ls dist/*_debug.apk)"
+          RELEASE_APK="$(ls dist/*_release.apk)"
+          python3 tools/dex_trim_check.py "$DEBUG_APK" "$RELEASE_APK"
+
       # 发布目标：**每次构建一个新 tag**（`<版本>_<时间>_<短号>`），不往固定页滚动更新。
       #   于是每个版本各有独立页面，历史可逐页回看；页面之间靠 tag 区分。
       - name: Resolve release target
