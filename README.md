@@ -3,13 +3,15 @@
 MX Player 增强模块（libxposed API 102 / LSPosed）：让 MX Player 的「本地网络」在 SMB 之外支持 **WebDAV**。
 
 > ⚠️ **当前状态：开发中（阶段 B · 浏览/播放已真机跑通，缩略图待复验）**
-> - 列目录：真机 http 与 https **都**跑通（一次列出 591 项）
+> - 列目录：真机 http 与 https **都**跑通（一次列出 591 项）。传输层已改用 **OkHttp** ——
+>   平台自带的 `HttpURLConnection` 不支持 `PROPFIND` 这类非标准动词，旧版靠反射改框架字段，
+>   而 Android 的 https 是委托壳 ⇒ 写壳等于没写 ⇒ 请求以 `POST` 发出去 ⇒ 501
 > - 播放：真机 http **已能播放**（凭据内联进 URL 的 userinfo 之后）
 > - 缩略图：仍未显示 —— 已定位到原因（MX 的 `MxImageDownloader` 对 http(s) 用
->   `HttpURLConnection` 取流且**不带任何鉴权头** ⇒ 401 ⇒ 只留占位图），本版加了 hook ④ 补头，
->   待真机复验
+>   `HttpURLConnection` 取流且**不带任何鉴权头** ⇒ 401 ⇒ 只留占位图），本版加了 hook ④ 补头 +
+>   **取流判定日志**（报最终响应码：`401` = 头没落到线上；`206/200` = 头到了、问题在宿主解码），待真机复验
 > - https 的边界不变：**浏览**可以（本模块自己放宽校验），自签证书下**播放/缩略图**仍可能被
->   MX 自带 FFmpeg 拒
+>   MX 自带 FFmpeg / 图片加载器拒（那两者的证书校验不在本模块手里）
 
 ## 功能
 
@@ -21,7 +23,9 @@ MX Player 增强模块（libxposed API 102 / LSPosed）：让 MX Player 的「�
 - 列目录走一次 `PROPFIND`（`Depth: 1`）：目录优先、只显示媒体文件（判据与 SMB 路径一致：用 MX 自己的 `MediaExtensions`）
 - 缩略图：改用条目自身的 URL 交给 MX 的图片加载器（MX 原逻辑用 `getHost()+getPath()` 重建 URL ⇒ **丢端口**，非 80/443 的服务器必然加载不出来）；
   并给图片取流补上 `Authorization`（MX 的图片取流**不认** URL 里的 userinfo ⇒ 不加就是 401、缩略图空白）
-- 列目录的 `PROPFIND`：动词写到「真正发请求的那个对象」上（Android 的 https 是委托壳，只写壳等于没发出去）；服务端回 501/405 时自动改用手写 HTTP/1.1 重试一次
+- 列目录的 `PROPFIND`：传输层用 **OkHttp**。平台自带的 `HttpURLConnection` 不收 `PROPFIND` 这种非标准动词
+  （`setRequestMethod` 有白名单），且 Android 的 https 是**委托壳**（写壳上的字段等于没写 ⇒ 请求会以 `POST` 发出去 ⇒ 服务端 501）——
+  旧版为此要反射改框架内部字段，现已整段删除
 - 播放：把凭据内联成 URL 的 userinfo（`http://用户:密码@主机:端口/…`）—— MX 用 `uri.getUserInfo()` 生成 `Authorization: Basic` 交给 FFmpeg；**URL 里没有 userinfo 就等于播放不带鉴权**
 - 凭据另一条路走 `Authorization: Basic` 请求头（列目录用），**绝不写进请求行**（URL 里的 userinfo 一律先剥掉再发）
 - 地址既支持「服务器」与「分享路径」分栏填写，也支持把凭据写进 URL（`http://用户:密码@主机/路径`）
@@ -69,12 +73,15 @@ MX Player 增强模块（libxposed API 102 / LSPosed）：让 MX Player 的「�
 - 进「本地网络」点开 WebDAV 服务器后：
   - `[webdav] RemoteDataSource#listDir path=… → 子项 n（目录 m）… 返回 k 项` = **列目录成功**
   - `[webdav] 列目录失败 path=…` = 列目录报错，同一条日志带 HTTP 状态或异常原因（`401/403` 查账号密码与匿名勾选，`404` 查地址与结尾斜杠，`SSLHandshakeException` 查证书）
-  - `PROPFIND … → HTTP 501` = **动词没真正发出去**（服务端收到的是 `POST`）。只可能发生在反射写 `method` 写不到「真正发请求的那个对象」时；本模块会自动改用手写 HTTP/1.1 重试，若这行之后仍失败，把日志给我（流水里会写明走了哪条路径）
+  - `PROPFIND … → HTTP 501` = 服务端**不认识这个动词**。旧版曾在 https 上因「动词没发出去（被发成 `POST`）」而报这行（原因是反射写框架字段写到了委托壳上）—— 改用 OkHttp 后这一类已不存在 ⇒ 现在看到它，先确认**服务端本身**支持 WebDAV 的 `PROPFIND`
+  - `CLEARTEXT communication to … not permitted` = 宿主 App 的明文（http）策略不允许该地址 —— 与 WebDAV 地址是否用 http 有关，把日志给我
   - `MalformedURLException: invalid port: …` = 密码里含 `?` / `#` 这类 URL 结构字符，而 URL 里放的是**解码后的真凭据**（编码形态才是对的，见上表）
   - 日志里**一个 hook 调用都没有** → 不是 hook 失效，而是**目录列举没被触发**：停在「本地网络」列表页不算进入目录；目录页**有缓存**时也不会重新列举，**下拉刷新**可强制重新列举
 - 缩略图：`[DBG] >> SmbUtil#buildThumbUrl 改用条目 path=…` = 缩略图 URL 已改走条目自身 URL（debug 版只打前 3 次）；
   `[DBG] >> 取流补上 Authorization（图片/缩略图链路）` = 取图请求已补上鉴权头（debug 版只打前 8 次）；
-  两者都有、缩略图仍空白 ⇒ 取流已带鉴权，问题在 MX 那边的解码/取帧，日志给我继续查
+  `[DBG] << 取流判定 HTTP <码>` = 这次取流**最终拿到的响应码**（同一条连接只报一次）——
+  `401` = 我们的头没落到线上；`206`/`200` = 头到了、问题在宿主解码。**这一行就是用来区分这两种失败的**
+  （没有它，两者在日志里长得一模一样）。三者都有、缩略图仍空白 ⇒ 把这三行日志给我
 - 日志完全无 `MxPlayerTune` → 模块未启用或未生效（检查 LSPosed 中的启用状态与作用域）
 
 ## 版本
