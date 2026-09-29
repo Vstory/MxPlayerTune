@@ -32,8 +32,8 @@ import io.github.libxposed.api.XposedModuleInterface;
  *   <li>{@code SmbUtil} 的缩略图 URL 构造方法 —— 对 http(s) 直接返回条目 {@code path}
  *       （MX 自己重建 URL 时用 {@code getHost()+getPath()} ⇒ 丢端口，非 80/443 必然拿不到缩略图）</li>
  *   <li>{@code java.net.URL#openConnection()} —— 图片/缩略图取流补 {@code Authorization}：
- *       缩略图走 Glide，而 Glide 的取流<b>不</b>把 URL 里的 userinfo 变成鉴权头
- *       ⇒ 否则「能列目录、能播放，只有缩略图空白」（见 {@link #hookUrlAuth}）</li>
+ *       宿主的图片取流是<b>裸</b> {@code HttpURLConnection}，<b>不</b>把 URL 里的 userinfo
+ *       变成鉴权头 ⇒ 否则「能列目录、能播放，只有缩略图空白」（见 {@link #hookUrlAuth}）</li>
  * </ol>
  *
  * <p>生命周期：onModuleLoaded → onPackageReady → installHooks
@@ -245,7 +245,7 @@ public class MainHook extends XposedModule {
         }
         hookThumbnailUrl(HookTargets.smbUtilBuildUrl(sSmbUtilCls));
 
-        // hook ④：图片/缩略图取流补 Basic 鉴权（Glide 的取流不认 URL 里的 userinfo）
+        // hook ④：图片/缩略图取流补 Basic 鉴权（宿主的取流不认 URL 里的 userinfo）
         hookUrlAuth();
 
         log(INFO, TAG, "installHooks done: " + sHookOk + " OK / " + sHookFail + " FAIL" + DETAIL);
@@ -445,25 +445,31 @@ public class MainHook extends XposedModule {
 
     // ===== hook ④：图片取流补 Basic 鉴权 =====
 
-    /** 本 hook 的 DEBUG 明细只打前几次（列表页滚动会反复取图）。 */
-    private static final int AUTH_LOG_MAX = 8;
-    private static int sAuthLogged;
+    /**
+     * 补鉴权（缩略图链路）的明细配额；「宿主来取图但 URL 无凭据」走 {@link LogBudget#IMAGE_BARE}。
+     *
+     * <p>真机踩过（见 hook信息记录.md §三.4）：宿主自己取「列目录 URL」时也不带凭据，
+     * 两个分支共用一个计数器时，7 条这类噪声会把缩略图那条<b>挤掉</b>
+     * （旧代码 {@code AUTH_LOG_MAX=8} 恰好被 7+1 用满 ⇒ 之后 {@code buildThumbUrl} 再被调用也没有日志，
+     * 容易被误读成「宿主没去取图」或「命中缓存」）。配额分离与「不被挤掉」由 verify 的 L 段钉住。
+     */
 
     /**
      * 给「URL 里带 userinfo 的 http(s) 取流」补上 {@code Authorization} 头。
      *
      * <p>真机事实（见 hook信息记录.md §三.4）：<b>播放与缩略图走的不是同一套鉴权</b>。
      * 播放交给 MX 自己的 FFPlayer，它会按 {@code uri.getUserInfo()} 生成
-     * {@code Authorization} 选项（{@code wJ.c(uri)}）⇒ 带鉴权；而缩略图/图片走
-     * {@code hr0.a} → {@code ImageLoader}（{@code LVL}）→ <b>Glide</b> 的
-     * {@code HttpUrlFetcher}，它<b>不认</b> URL 里的 userinfo（Glide 的取流只看
-     * {@code GlideUrl} 自带的 header 表）⇒ 服务端 401 ⇒ 缩略图一直空白，且<b>不报错</b>
+     * {@code Authorization} 选项（{@code wJ.c(uri)}）⇒ 带鉴权；而缩略图走
+     * {@code hr0.a} → {@code ImageLoader}（{@code LVL}）→ {@code MxImageDownloader}
+     * （{@code l50}，UIL 的下载器子类，dex 里保留着源文件名），它的 http 分支就是一条
+     * <b>裸</b> {@code HttpURLConnection}：<b>没有一步</b>把 URL 的 userinfo 变成请求头
+     * （它只按「响应码不等于 200 就抛」处理）⇒ 服务端 401 ⇒ 缩略图一直空白，且<b>不报错</b>
      * （只有 401 → 显示占位图，日志里什么都没有）。
      *
-     * <p>为什么挂在 {@code java.net.URL#openConnection()} 上（不挂混淆名的 Glide 类）：
+     * <p>为什么挂在 {@code java.net.URL#openConnection()} 上（不挂混淆名的图片加载类）：
      * <ol>
      *   <li>它是不依赖版本/混淆名的一层，凡走 {@code java.net} 的取流都被覆盖
-     *       （Glide 默认取流、OkHttp 的 URLConnection 桥、MX 自己的取图）</li>
+     *       （宿主自己的取图、OkHttp 的 URLConnection 桥）</li>
      *   <li>载荷零风险：<b>只对 userinfo 非空的 http(s) URL 生效</b>，且已有
      *       {@code Authorization} 时不覆盖 —— 其它网络请求一律原样放行</li>
      * </ol>
@@ -511,33 +517,120 @@ public class MainHook extends XposedModule {
             return;
         }
         java.net.URLConnection conn = (java.net.URLConnection) result;
-        boolean added = WebDavClient.injectUrlAuth(conn);
-        if (!BuildConfig.DEBUG || sAuthLogged >= AUTH_LOG_MAX) {
-            return;
-        }
         String raw;
         try {
             raw = conn.getURL() == null ? "?" : conn.getURL().toExternalForm();
         } catch (Throwable t) {
             raw = "?";
         }
-        if (added) {
-            sAuthLogged++;
+        if (!WebDavClient.injectUrlAuth(conn)) {
+            // 这条是给「缩略图仍空白」准备的关键线索：说明宿主确实来取图了，但 URL 里没有凭据
+            if (BuildConfig.DEBUG && raw.contains("/dav") && LogBudget.IMAGE_BARE.take()) {
+                log(DEBUG, TAG, "[DBG] >> 取流未带凭据（URL 无 userinfo）url="
+                        + RemoteEntries.maskUserInfo(raw));
+            }
+            return;
+        }
+        if (BuildConfig.DEBUG && LogBudget.IMAGE_AUTH.take()) {
             log(DEBUG, TAG, "[DBG] >> 取流补上 Authorization（图片/缩略图链路） url="
                     + RemoteEntries.maskUserInfo(raw) + " conn=" + conn.getClass().getSimpleName());
-        } else if (raw.contains("/dav")) {
-            // 这条是给「缩略图仍空白」准备的关键线索：说明宿主确实来取图了，但 URL 里没有凭据
-            sAuthLogged++;
-            log(DEBUG, TAG, "[DBG] >> 取流未带凭据（URL 无 userinfo）url="
-                    + RemoteEntries.maskUserInfo(raw));
+        }
+        armVerdict(conn, raw);
+    }
+
+    // ===== hook ④ 的判据：这条取流最后拿到了什么 =====
+
+    /**
+     * 「补过鉴权的连接」→ 其 URL。只用于判定日志，键用<b>对象同一性</b>
+     * （同一 URL 的多次取流必须各自记账，否则第二次的响应码会被算到第一次头上）。
+     */
+    private static final java.util.Map<Object, String> sInjected =
+            java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<Object, String>());
+
+    /** 已挂钩的「取流结果」方法（按声明类去重，避免同一 Method 挂两遍）。 */
+    private static final java.util.Set<String> sVerdictArmed = new java.util.HashSet<String>();
+
+
+    /**
+     * 给「刚补过鉴权的连接」挂一个<b>只读</b>的取流结果判定，把响应码写进日志。
+     *
+     * <p>为什么非要有这一条（真机教训）：host 的取图链路对失败是<b>静默</b>的 ——
+     * 401 只表现为「占位图 + 日志里什么都没有」。而这条链路有两种截然不同的失败：
+     * <ul>
+     *   <li>响应码 401 ⇒ 我们的头没落到线上（补鉴权没生效）</li>
+     *   <li>响应码 206 / 200 ⇒ 取流成功，问题在<b>宿主侧解码</b></li>
+     * </ul>
+     * 不把响应码打出来，这两者在真机日志里长得一模一样。206 尤其要能看见：服务端只在带
+     * {@code Range} 时回 206，而 {@code MxImageDownloader} 是按「不等于 200 就抛」写的。
+     *
+     * <p>只对「本次真的补过头」的连接记账；判定失败一律静默，绝不影响宿主行为。
+     */
+    private void armVerdict(final java.net.URLConnection conn, final String raw) {
+        if (!BuildConfig.DEBUG) {
+            return;
+        }
+        try {
+            synchronized (sInjected) {
+                if (sInjected.size() >= 64) {
+                    sInjected.clear();
+                }
+                sInjected.put(conn, raw);
+            }
+            final Method rc = conn.getClass().getMethod("getResponseCode");
+            rc.setAccessible(true);
+            final String key = rc.getDeclaringClass().getName() + "#getResponseCode";
+            synchronized (sVerdictArmed) {
+                if (!sVerdictArmed.add(key)) {
+                    return;
+                }
+            }
+            hook(rc).intercept(new XposedInterface.Hooker() {
+                @Override
+                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    Object result = chain.proceed();
+                    try {
+                        logVerdict(chain.getThisObject(), result);
+                    } catch (Throwable ignored) {
+                        // 判定日志绝不影响取流
+                    }
+                    return result;
+                }
+            });
+        } catch (Throwable t) {
+            synchronized (sVerdictArmed) {
+                sVerdictArmed.clear();
+            }
+            log(DEBUG, TAG, "[DBG] hook ④ 取流判定未挂上（不影响取流）: " + t);
+        }
+    }
+
+    /** 打完一条判定就销账（同一连接只报一次）。 */
+    private void logVerdict(Object self, Object code) {
+        String url;
+        synchronized (sInjected) {
+            url = sInjected.remove(self);
+        }
+        if (url == null || !LogBudget.IMAGE_VERDICT.take()) {
+            return;
+        }
+        String extra = "";
+        try {
+            if (self instanceof java.net.HttpURLConnection) {
+                java.net.HttpURLConnection c = (java.net.HttpURLConnection) self;
+                extra = " type=" + c.getContentType() + " len=" + c.getContentLength();
+            }
+        } catch (Throwable ignored) {
+            // 读 header 失败不影响判定本身
+        }
+        if (BuildConfig.DEBUG) {
+            log(DEBUG, TAG, "[DBG] << 取流判定 HTTP " + code + extra + "（206=带 Range，401=鉴权没生效，"
+                    + "200=正常）url=" + RemoteEntries.maskUserInfo(url));
         }
     }
 
     // ===== hook ③：SmbUtil 缩略图 URL 构造 =====
 
     /** 本 hook 的 DEBUG 明细只打前几次（列表页每次滚动都会调它，逐行打会淹掉日志）。 */
-    private static final int THUMB_LOG_MAX = 3;
-    private static int sThumbLogged;
 
     /**
      * MX 生成缩略图 URL 时用 {@code uri.getHost() + uri.getPath()} 重建（丢端口、凭据取字段原值）。
@@ -562,8 +655,7 @@ public class MainHook extends XposedModule {
                     if (!HookTargets.isHttpUrl(path)) {
                         return chain.proceed();
                     }
-                    if (BuildConfig.DEBUG && sThumbLogged < THUMB_LOG_MAX) {
-                        sThumbLogged++;
+                    if (BuildConfig.DEBUG && LogBudget.THUMB_URL.take()) {
                         log(DEBUG, TAG, "[DBG] >> " + desc + " 改用条目 path="
                                 + RemoteEntries.maskUserInfo(path));
                     }
