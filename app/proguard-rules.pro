@@ -24,8 +24,10 @@
 #    2026-09-29 实测后果：探针（Probe/ProbeRange，调用点在 `if (BuildConfig.DEBUG)` 内）
 #    整片跟着进了 release dex（release 里 `/proc/self/maps`、`mxpt-probe.txt` 都在）。
 #    所以这里只保「框架真的会调的那四个」：构造器 + 三个生命周期回调。
-#    签名由 XposedModuleInterface 决定；升级 libxposed 版本时要跟着核（漏了 = 模块装得上但不生效，
-#    tools/dex_trim_check.py 的第 ⑤ 组断言就是防这个）。
+#    签名由 XposedModuleInterface 决定；升级 libxposed 版本时要跟着核（漏了 = 模块装得上但不生效）。
+#    ⚠️ 这一条**不必靠真机复验**：tools/dex_trim_check.py 第 ⑤ 组读 seeds.txt（R8 对 keep 规则的
+#    **匹配结果** —— 名字写错、签名漂移、整块被删都会让种子行消失）断言这四张签名真的绑上了，
+#    第 ⑥ 组再从 mapping.txt 断言它们在 release 里存活且**未改名**；两份独立产物，同一条结论。
 -keep class io.github.vstory.hook.mxplay.MainHook {
     public <init>();
     public void onModuleLoaded(io.github.libxposed.api.XposedModuleInterface$ModuleLoadedParam);
