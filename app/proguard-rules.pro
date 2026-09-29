@@ -18,7 +18,20 @@
 
 # ① 模块入口：resources/META-INF/xposed/java_init.list 里按「类全名」声明。
 #    libxposed 的 XposedProvider 按这串名字反射加载入口，混淆即失效。
--keep class io.github.vstory.hook.mxplay.MainHook { *; }
+#
+#    ⚠️ 刻意**不**写 `{ *; }` —— 这个通配符会把 MainHook 的**每个**方法都当入口保住，
+#    包括那些「javac 已经折叠掉调用点、字节码里没人引用」的 debug 专属 helper。
+#    2026-09-29 实测后果：探针（Probe/ProbeRange，调用点在 `if (BuildConfig.DEBUG)` 内）
+#    整片跟着进了 release dex（release 里 `/proc/self/maps`、`mxpt-probe.txt` 都在）。
+#    所以这里只保「框架真的会调的那四个」：构造器 + 三个生命周期回调。
+#    签名由 XposedModuleInterface 决定；升级 libxposed 版本时要跟着核（漏了 = 模块装得上但不生效，
+#    tools/dex_trim_check.py 的第 ⑤ 组断言就是防这个）。
+-keep class io.github.vstory.hook.mxplay.MainHook {
+    public <init>();
+    public void onModuleLoaded(io.github.libxposed.api.XposedModuleInterface$ModuleLoadedParam);
+    public void onPackageReady(io.github.libxposed.api.XposedModuleInterface$PackageReadyParam);
+    public boolean onHotReloading(io.github.libxposed.api.XposedModuleInterface$HotReloadingParam);
+}
 
 # ①′ 模块自己的其余类（WebDavClient / HookTargets / RemoteEntries / LogBudget）只保留名字：
 #     keepnames **不阻止裁剪**，所以体积代价近乎为零（本项目统共 5 个类），

@@ -279,30 +279,23 @@ final class HookTargets {
         if (c.getDeclaredFields().length != 0) {
             return "有 " + c.getDeclaredFields().length + " 个字段（纯静态工具类应无字段）";
         }
-        Method url = null;
-        Method view = null;
-        for (Method m : c.getDeclaredMethods()) {
-            if (!Modifier.isStatic(m.getModifiers())) {
-                continue;
-            }
-            if (m.getReturnType() == String.class && m.getParameterCount() == 1
-                    && m.getParameterTypes()[0] == anchor) {
-                url = m;
-            } else if (m.getReturnType() == void.class && m.getParameterCount() == 5
-                    && CLS_IMAGE_VIEW.equals(m.getParameterTypes()[0].getName())
-                    && m.getParameterTypes()[1] == String.class
-                    && m.getParameterTypes()[2] == int.class
-                    && m.getParameterTypes()[3] == int.class
-                    && CLS_DRAWABLE.equals(m.getParameterTypes()[4].getName())) {
-                view = m;
-            }
-        }
-        if (url == null) {
+        if (urlMethodOf(c, anchor) == null) {
             return "无 static (RemoteEntry)String（static 方法: " + staticMethods(c) + "）";
         }
-        if (view == null) {
+        if (smbUtilLoadThumb(c) == null) {
             return "无 static (ImageView,String,int,int,Drawable)V（缩略图加载入口；static 方法: "
                     + staticMethods(c) + "）";
+        }
+        return null;
+    }
+
+    /** 判据用：{@code static (锚点)String}（比 {@link #smbUtilBuildUrl} 更严，要求参数就是锚点类型）。 */
+    private static Method urlMethodOf(Class<?> c, Class<?> anchor) {
+        for (Method m : c.getDeclaredMethods()) {
+            if (Modifier.isStatic(m.getModifiers()) && m.getReturnType() == String.class
+                    && m.getParameterCount() == 1 && m.getParameterTypes()[0] == anchor) {
+                return m;
+            }
         }
         return null;
     }
@@ -315,6 +308,33 @@ final class HookTargets {
         for (Method m : cls.getDeclaredMethods()) {
             if (Modifier.isStatic(m.getModifiers()) && m.getReturnType() == String.class
                     && m.getParameterCount() == 1) {
+                return m;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 取 SmbUtil 的缩略图加载入口 {@code a(ImageView, String, int, int, Drawable)}。
+     *
+     * <p>为什么需要它（虽然是**只读**用途）：它的第 3/4 个参数就是<b>宿主真正要的像素尺寸</b>
+     * （{@code w × h}）。hook ③ 只换 URL、看不到这两个数 ⇒ 我们给的 JPEG 该多宽，
+     * 原先只能按「宿主那一格大约是 144dp」推算。{@link Probe} 挂它一次，就能把<b>本机真值</b>
+     * 拿到手（决定 {@link ThumbSize#WIDTH} 是否有必要再调）。生产路径不挂它。
+     */
+    static Method smbUtilLoadThumb(Class<?> cls) {
+        if (cls == null) {
+            return null;
+        }
+        for (Method m : cls.getDeclaredMethods()) {
+            if (!Modifier.isStatic(m.getModifiers()) || m.getReturnType() != void.class
+                    || m.getParameterCount() != 5) {
+                continue;
+            }
+            Class<?>[] p = m.getParameterTypes();
+            if (CLS_IMAGE_VIEW.equals(p[0].getName()) && p[1] == String.class
+                    && p[2] == int.class && p[3] == int.class
+                    && CLS_DRAWABLE.equals(p[4].getName())) {
                 return m;
             }
         }

@@ -29,17 +29,22 @@ import java.util.Map;
  * 抽帧多一次深跳，就可能把宿主的图片加载器拖到超时（它一超时就是「占位图」，等于没修）。
  * 换言之：这里用「首帧」换「稳定出图」——一张稍显平淡的图，好过一张永远不出现的图。
  *
+ * <p><b>尺寸</b>：{@link ThumbSize}（432 宽 × q80）。原先给 640 宽，而宿主那一格只有
+ * 144dp×84dp（3 倍密度 = 432×252）、且是按 {@code RGB_565} 解码的 ⇒ 多出来的像素只会
+ * 变成字节与一次宿主侧的再缩放。
+ *
+ * <p><b>还没定论的一条（探针在测）</b>：MX 自己抽本地/SMB 缩略图用的是它自带的 native 引擎
+ * （{@code com.mxtech.media.MediaReader.extractThumb}，见 {@link Probe}）——如果那个引擎
+ * 既能吃回环 http、帧又与这里一致，就该把它前置成快路径（本类退化成回落）。
+ * 探针结果出来之前，这里不动。
+ *
  * <p><b>为什么这一段不做离机断言</b>：{@code MediaMetadataRetriever} 是平台件，离机没有等价物。
  * 因此本类刻意保持「薄」——所有会被判错的逻辑（分片区间、总长、偏移校验、HTTP 应答、缓存与令牌）
- * 都在 {@link RangeSource} 与 {@link ThumbServer} 里，那两个类由 verify 的 M/N 段逐条钉住。
+ * 都在 {@link RangeSource} 与 {@link ThumbServer} 里，那两个类由 verify 的 M/N 段逐条钉住；
+ * 连「缩到多大」都被拆到了无 Android 依赖的 {@link ThumbSize}（verify 的 O 段）。
  */
 final class ThumbFrames implements ThumbServer.Frames {
 
-    /** 生成图宽度上限（宿主列表/卡片的展示尺寸远小于此；再大只是白费流量）。 */
-    static final int MAX_WIDTH = 640;
-
-    /** JPEG 质量（80 在 640 宽下约 30–60 KB）。 */
-    static final int QUALITY = 80;
 
     @Override
     public byte[] jpeg(ThumbServer.Source src) throws Exception {
@@ -72,10 +77,10 @@ final class ThumbFrames implements ThumbServer.Frames {
             }
         }
 
-        Bitmap scaled = scale(frame, MAX_WIDTH);
+        Bitmap scaled = scale(frame, ThumbSize.WIDTH);
         try {
             ByteArrayOutputStream out = new ByteArrayOutputStream(64 * 1024);
-            if (!scaled.compress(Bitmap.CompressFormat.JPEG, QUALITY, out)) {
+            if (!scaled.compress(Bitmap.CompressFormat.JPEG, ThumbSize.QUALITY, out)) {
                 throw new IOException("JPEG 编码失败（compress 返回 false）");
             }
             return out.toByteArray();
@@ -137,15 +142,15 @@ final class ThumbFrames implements ThumbServer.Frames {
         return h;
     }
 
-    /** 等比缩到宽度上限（原图已够小则原样返回）。 */
+    /** 等比缩到宽度上限（原图已够小则原样返回）。算式在 {@link ThumbSize} 里（可离机断言）。 */
     private static Bitmap scale(Bitmap src, int maxWidth) {
         int w = src.getWidth();
         int h = src.getHeight();
         if (w <= maxWidth || w <= 0) {
             return src;
         }
-        int h2 = Math.max(1, (int) Math.round(h * (double) maxWidth / w));
-        return Bitmap.createScaledBitmap(src, maxWidth, h2, true);
+        int h2 = ThumbSize.scaledHeight(w, h, maxWidth);
+        return Bitmap.createScaledBitmap(src, maxWidth, h2 <= 0 ? h : h2, true);
     }
 
     private static String brief(Throwable t) {

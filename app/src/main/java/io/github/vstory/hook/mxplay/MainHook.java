@@ -103,6 +103,11 @@ public class MainHook extends XposedModule {
         log(INFO, TAG, "[pkg] onPackageReady, classLoader=" + (cl != null ? "non-null" : "NULL!"));
         try {
             installHooks(cl);
+            if (BuildConfig.DEBUG) {
+                // 真机抽帧探针（debug 专属）：只有 /storage/emulated/0/Download/Ai/logs/mxpt-probe.txt
+                // 存在时才干活；release 里这个分支恒假 ⇒ 整个 Probe/ProbeRange 被 R8 摘掉
+                startProbe(cl);
+            }
         } catch (Throwable t) {
             log(ERROR, TAG, "[ERR] installHooks threw: " + t, t);
         }
@@ -668,10 +673,14 @@ public class MainHook extends XposedModule {
     /**
      * MX 生成缩略图 URL 时用 {@code uri.getHost() + uri.getPath()} 重建（丢端口、凭据取字段原值）。
      *
-     * <p>对 http(s) 的**视频**条目返回环回缩略图服务的 URL：宿主取的是条目自身 URL、
-     * 且整片下载<b>不发 {@code Range}</b>（真机实测 {@code 200} + {@code len=391840912} + {@code video/mp4}），
-     * 它面对整片视频只能解码失败 ⇒ 只留占位图。环回服务用 {@code Range} 分片取流 + 抽帧，
+     * <p>对 http(s) 的**视频**条目返回环回缩略图服务的 URL（{@code http://127.0.0.1:<固定端口>/t/<确定性令牌>.jpg}）：
+     * 宿主取的是条目自身 URL、且整片下载<b>不发 {@code Range}</b>（真机实测 {@code 200} + {@code len=391840912}
+     * + {@code video/mp4}），它面对整片视频只能解码失败 ⇒ 只留占位图。环回服务用 {@code Range} 分片取流 + 抽帧，
      * 把一张**真 JPEG** 放到宿主面前（宿主自己的图片加载器照旧工作，不需要它支持任何新东西）。
+     *
+     * <p>URL 的稳定性是有意为之（端口固定 + 令牌由条目 URL/账号/密码算出）：宿主的图片加载器
+     * <b>自带磁盘缓存</b>，键就是这条 URL ⇒ 稳定的 URL 能让它跨进程命中，第二次进同一目录
+     * 连我们的服务都不会被请求（详见 {@link ThumbServer}）。
      *
      * <p>非 http(s)（SMB）、非视频、或服务未起来 ⇒ 一律退回旧行为（返回条目 {@code path}）：
      * 那时最坏也就是今天的「空白缩略图」，绝不会影响浏览与播放。
@@ -722,6 +731,61 @@ public class MainHook extends XposedModule {
             if (BuildConfig.DEBUG) {
                 log(DEBUG, TAG, "[DBG] hook FAIL: " + desc + " -> " + t);
             }
+        }
+    }
+
+    // ===== 真机抽帧探针（debug 专属，见 Probe）=====
+
+    /**
+     * 起探针（非阻塞）。{@link Probe} 只在触发文件存在时才真的跑，且只<b>读</b> MX 的类。
+     */
+    private void startProbe(ClassLoader cl) {
+        Probe.maybeStart(cl, sProcessName, versionLabel(), new Probe.Bridge() {
+            @Override
+            public void info(String msg) {
+                log(INFO, TAG, msg);
+            }
+
+            @Override
+            public void error(String msg, Throwable t) {
+                log(ERROR, TAG, msg, t);
+            }
+
+            @Override
+            public boolean armSizeProbe(Method entry, Probe.SizeSink seen) {
+                return hookSizeProbe(entry, seen);
+            }
+        });
+    }
+
+    /**
+     * 只读挂一次「宿主真正请求的缩略图像素尺寸」观察器（探针的 P0）。
+     *
+     * <p>载荷只有「把两个 int 记下来 + 原样放行」：{@code chain.proceed()} 永远先于任何判断执行，
+     * 任何异常都吞掉 —— 这是探针的旁挂钩子，绝不许影响宿主的列表渲染。
+     */
+    private boolean hookSizeProbe(Method target, final Probe.SizeSink seen) {
+        try {
+            target.setAccessible(true);
+            hook(target).intercept(new XposedInterface.Hooker() {
+                @Override
+                public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    try {
+                        Object w = chain.getArg(2);
+                        Object h = chain.getArg(3);
+                        if (w instanceof Integer && h instanceof Integer) {
+                            seen.seen((Integer) w, (Integer) h);
+                        }
+                    } catch (Throwable ignored) {
+                        // 探针收数失败不影响宿主
+                    }
+                    return chain.proceed();
+                }
+            });
+            return true;
+        } catch (Throwable t) {
+            log(ERROR, TAG, "[probe] 尺寸观察器没挂上（P0 只能报未知）: " + t, t);
+            return false;
         }
     }
 

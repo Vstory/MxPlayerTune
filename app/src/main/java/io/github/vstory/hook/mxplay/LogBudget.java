@@ -38,6 +38,9 @@ final class LogBudget {
     /** 环回缩略图服务：渲染失败一行 —— 宿主只会显示占位图、不报错，这一行是唯一线索，给足。 */
     static final LogBudget THUMB_FAIL = new LogBudget(8);
 
+    /** 环回缩略图服务：命中「失败负缓存」（TTL 内不重试）—— 只说明「没重复抽帧」，明细给几次就够。 */
+    static final LogBudget THUMB_FAILHIT = new LogBudget(4);
+
     private final int max;
     private int used;
 

@@ -29,12 +29,27 @@ import zipfile
 MARKER = b"[DBG]"
 
 # release dex 里**必须**存在的名字（dex 字符串池里是类描述符形态）。
-REQUIRED_IN_RELEASE = (
+REQUIRED_IN_RELEASE = [
     (b"Lio/github/vstory/hook/mxplay/MainHook;",
      "模块入口类 —— 写在 resources/META-INF/xposed/java_init.list，LSPosed 按类全名反射加载"),
     (b"Lio/github/libxposed/service/XposedProvider;",
      "libxposed service provider —— 写在 AndroidManifest 的 <provider android:name>，系统按名反射实例化"),
-)
+]
+
+# 收窄 keep 规则后仍需存活的生命周期回调（框架按 XposedModuleInterface 调它们）。
+# 为什么单列：`-keep class MainHook { … }` 只保了这四张签名，写错一个 = 框架调不到 =
+# 模块装得上但不生效，而这条同样是**静默**的。
+REQUIRED_IN_RELEASE.extend([
+    (b"onModuleLoaded", "MainHook 的生命周期回调之一（收窄后的 keep 规则必须覆盖它）"),
+    (b"onPackageReady", "MainHook 的生命周期回调之一（收窄后的 keep 规则必须覆盖它）"),
+    (b"onHotReloading", "MainHook 的生命周期回调之一（收窄后的 keep 规则必须覆盖它）"),
+])
+
+# 探针（真机抽帧对照实验）是 **debug 专属**：它的调用点在 `if (BuildConfig.DEBUG)` 内，
+# 因此 release 里必须**连字符串都没有**。这条与 [DBG] 那条是同一类失效模式（静默地把调试期
+# 才会跑的东西发给用户），但更隐蔽：探针会读 /proc/self/maps、按固定路径读写设备上的文件。
+# 2026-09-29 实测漏过一次：`-keep class MainHook { *; }` 把探针 helper 一起保住 ⇒ 整片进 release。
+PROBE_MARKERS = (b"/proc/self/maps", b"mxpt-probe", b"probe/local")
 
 
 def dex_bytes(apk_path):
@@ -94,9 +109,24 @@ def main(argv):
         else:
             print(f"  ✅ release 保名: {name.decode()}")
 
+    # ④ 探针必须只在 debug（判据同样是产物字节：漏出去 = 用户包里带一个会读写设备文件的实验件）。
+    for marker in PROBE_MARKERS:
+        in_release = marker in release_blob
+        in_debug = marker in debug_blob
+        if in_release:
+            print(f"::error::{argv[2]} 的 dex 里出现了探针特征串 {marker.decode()} —— "
+                  f"探针是 debug 专属（见 Probe.java 的调用点与 app/proguard-rules.pro 的 ① 注释）")
+            bad = True
+        elif in_debug:
+            print(f"  ✅ release 无探针 / debug 有: {marker.decode()}")
+        else:
+            print(f"::error::{argv[1]} 的 dex 里没有探针特征串 {marker.decode()} —— "
+                  f"排障包里的探针被削掉了？（那样真机对照实验根本跑不起来，而日志只会说「没触发」）")
+            bad = True
+
     if bad:
         return 1
-    print("  ✅ 变体裁剪正确（debug 有、release 零命中）+ R8 保名齐全")
+    print("  ✅ 变体裁剪正确（debug 有、release 零命中）+ R8 保名齐全 + 探针仅在 debug")
     return 0
 
 
