@@ -60,7 +60,18 @@ android {
             versionNameSuffix = "-debug"
         }
         release {
-            isMinifyEnabled = false
+            // R8 开（release 专属，debug 保持不混淆以便排障）：
+            //   ① 裁掉 okhttp/okio 里用不到的部分（本模块对这一层只要「一个 PROPFIND + 取流 + 自签放宽」）；
+            //   ② 自动消除 `if (BuildConfig.DEBUG)` 恒假分支 —— 这正是断言 ⑦ 要的（javac 删不掉
+            //      「写在独立方法里」的 [DBG] 字符串常量，2026-09-29 真漏过一次）。
+            // keep 规则的三类名字见 app/proguard-rules.pro（写在资源/清单里、按名反射加载）
+            // **门禁不撤**：tools/dex_trim_check.py 仍读产物字节断言，不依赖「R8 一定会删」。
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
             if (hasSigning) {
                 signingConfig = signingConfigs.getByName("release")
             }
