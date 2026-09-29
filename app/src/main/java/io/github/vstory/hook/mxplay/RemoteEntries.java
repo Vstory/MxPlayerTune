@@ -290,6 +290,22 @@ final class RemoteEntries {
         return url.substring(0, authStart) + "***:***" + url.substring(at);
     }
 
+    /**
+     * 列目录日志里「实际请求 URL」那一段：与条目 path 相同则省略，不同才接上 —— 且**必须脱敏**。
+     *
+     * <p>为什么单独一个方法（真机事故，2026-09-29）：条目 {@code path} 一路都过了
+     * {@link #maskUserInfo}，唯独 {@code req=} 那一处直接拼了原始 {@code reqUrl} ⇒ 日志里落下
+     * {@code req=http://用户:编码后的密码@host:29798/dav/…} —— 与 README「本模块日志一律脱敏成
+     * {@code ***:***}」的承诺不符（该日志是要贴给别人看的）。脱敏写进这个方法是一种结构约束：
+     * 调用点拿不到「不脱敏」的写法 ⇒ 接缝处不会再漏第二次。
+     */
+    static String reqSuffix(String path, String reqUrl) {
+        if (reqUrl == null || reqUrl.equals(path)) {
+            return "";
+        }
+        return " → req=" + maskUserInfo(reqUrl);
+    }
+
     // ===== 列表规划（纯逻辑，可离机验证）=====
 
     /** 规划项：显示名 + 同词干并列名 + MX 类型。 */

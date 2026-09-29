@@ -405,7 +405,7 @@ public class MainHook extends XposedModule {
             }
             long ms = (System.nanoTime() - t0) / 1_000_000L;
             log(INFO, TAG, "[webdav] " + desc + " path=" + RemoteEntries.maskUserInfo(path)
-                    + (reqUrl.equals(path) ? "" : " → req=" + reqUrl)
+                    + RemoteEntries.reqSuffix(path, reqUrl)
                     + " → 子项 " + children.size() + "（目录 " + dirs + "）"
                     + " 过滤=" + filter.kind() + " 返回 " + out.size() + " 项 / " + ms + " ms"
                     + (anonymity == 0 ? " 带凭据" : " 匿名"));
